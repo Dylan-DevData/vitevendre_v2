@@ -13,10 +13,10 @@ Toutes les routes `/api/uploads` exigent `Authorization: Bearer <jwt>`.
 | Fil | `GET /api/videos?before=<id>&limit=10` | `videos[].hlsUrl`, `posterUrl`, `nextBefore` |
 
 ## Règles pour le client
-- **fingerprint** = SHA-256 de (64 premiers Ko + 64 derniers Ko + taille exacte). Indépendant du nom du fichier :
+- **fingerprint** = signature SHA-256 chaînée de tous les blocs de 512 Ko et de la taille totale. Indépendante du nom du fichier :
   un fichier renommé reprend la même session, et un fichier remplacé en crée une nouvelle.
-- Taille de morceau libre entre 1 octet et `maxChunkBytes` (4 Mo par défaut). Le client peut donc l'adapter
-  (512 Ko à 2 Mo) selon le débit mesuré sur chaque morceau.
+- Taille de morceau libre entre 1 octet et `maxChunkBytes` (4 Mo par défaut). Le client l'adapte au débit :
+  512 Ko à 2 Mo dans le navigateur, et au plus 1 Mo sur Android pour borner le pont natif.
 - Après toute erreur réseau : `GET /api/uploads/:id`, puis reprise à `receivedBytes`. Jamais de réémission
   de ce qui est déjà validé. Un morceau interrompu en plein vol est ignoré par le serveur (le .tmp est
   ramené à l'offset validé avant l'écriture suivante).

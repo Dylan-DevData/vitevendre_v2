@@ -1,0 +1,9 @@
+{
+  "name": "com.vitevendre.persistent-video-source",
+  "version": "1.0.0",
+  "description": "Cordova Android system video picker with persisted URI access and bounded reads.",
+  "cordova": {
+    "id": "com.vitevendre.persistent-video-source",
+    "platforms": ["android"]
+  }
+}

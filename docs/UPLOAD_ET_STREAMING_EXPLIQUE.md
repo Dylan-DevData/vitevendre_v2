@@ -4,8 +4,8 @@ Ce document suit une vidéo depuis le sélecteur du téléphone jusqu’au backe
 
 ## Résumé en une minute
 
-1. Le client garde un objet `File` fourni par le navigateur/Cordova. Il ne charge pas le fichier vidéo entier en mémoire.
-2. Il lit une tranche à la fois avec `file.slice()`. La tranche commence à **512 Kio** (512 × 1024 octets), s’adapte au débit, et ne dépasse pas **2 Mio** (2 × 1024 × 1024 octets).
+1. Le navigateur garde un objet `File`. Android garde une URI `content://` accordée par le sélecteur système. Aucun des deux ne copie la vidéo entière en mémoire.
+2. Le client lit une tranche à la fois : `file.slice()` sur le web ou le pont natif Android. Elle commence à **512 Kio**, s’adapte au débit, et ne dépasse pas **2 Mio sur le web** ou **1 Mio sur Android**.
 3. Chaque tranche est envoyée en requête HTTP `PATCH`. Le backend la fait passer dans un flux Node.js vers un fichier temporaire `.tmp`.
 4. PostgreSQL enregistre l’offset confirmé. Après une coupure, le client demande cet offset au serveur et reprend à cet endroit.
 5. Quand tous les octets sont reçus, le backend vérifie la taille et le format, déplace le fichier source, met la vidéo en traitement et la place dans la file FFmpeg.
@@ -17,7 +17,9 @@ Ce document suit une vidéo depuis le sélecteur du téléphone jusqu’au backe
 
 Fichier : [`noteApp/www/js/ui/upload-ui.js`](../noteApp/www/js/ui/upload-ui.js)
 
-Le champ de sélection est un `<input type="file" accept="video/*">`. Le navigateur donne un objet `File`, qui décrit le fichier choisi et permet de lire des plages sans charger le tout.
+Sur le web, le champ `<input type="file">` fournit un objet `File` et le navigateur redemande ce fichier après un rechargement si la page a perdu sa référence. Sur Android, `noteApp/www/js/ui/upload-ui.js` appelle le pont natif [`noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java`](../noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java). Celui-ci ouvre `Intent.ACTION_OPEN_DOCUMENT`, conserve l’autorisation en lecture avec `takePersistableUriPermission`, puis stocke l’URI et les métadonnées dans `SharedPreferences`.
+
+Le pont [`noteApp/www/js/upload/native-video-source.js`](../noteApp/www/js/upload/native-video-source.js) représente cette URI comme une source lisible par plages. Il renvoie au JavaScript uniquement une plage encodée, jamais les octets du fichier complet. Si le fournisseur Android refuse l’accès persistant ou le déplacement de lecture, l’application explique qu’il faut choisir la vidéo avec Fichiers/Téléchargements.
 
 ```js
 // L’aperçu utilise une URL locale du fichier. Il ne transforme pas le fichier entier en chaîne/base64.
@@ -39,9 +41,9 @@ Par exemple, `file.slice(0, 524288)` lit les premiers 512 Kio. Au tour suivant, 
 
 ### Empreinte pour retrouver la même vidéo
 
-Avant l’envoi, `computeFingerprint()` dans `source.js` lit seulement les **64 Kio du début**, les **64 Kio de la fin** et utilise aussi la taille totale. Ces octets sont hachés en SHA-256 par [`noteApp/www/js/upload/sha256.js`](../noteApp/www/js/upload/sha256.js).
+Avant l’envoi, `computeFingerprint()` dans `source.js` parcourt le contenu par blocs fixes de **512 Kio**. Il calcule le SHA-256 de chaque bloc, puis chaîne chaque résultat avec le précédent et la taille totale. Ainsi, une modification au milieu du fichier change la signature. Le nom n’entre pas dans le calcul : renommer la vidéo ne change pas sa signature.
 
-Cette empreinte sert à retrouver une session interrompue, même si le fichier a été renommé. **Ce n’est pas un SHA-256 de tous les octets de la vidéo** et le serveur ne relit pas la vidéo entière pour recalculer cette empreinte.
+Cette vérification lit tout le fichier avant l’upload et encore une fois lors d’une reprise. Elle utilise au plus un bloc à la fois en mémoire ; elle ne copie jamais la vidéo entière dans la RAM ou dans un stockage local. SHA-256 est fourni par [`noteApp/www/js/upload/sha256.js`](../noteApp/www/js/upload/sha256.js).
 
 ## 2. Combien de mégaoctets par morceau ?
 
@@ -51,7 +53,7 @@ Fichier : [`noteApp/www/js/upload/chunk-sizer.js`](../noteApp/www/js/upload/chun
 |---|---:|
 | Début d’envoi ou après une erreur réseau | 512 Kio (0,5 Mio) |
 | Réseau stable et rapide | Augmente par pas de 256 Kio |
-| Maximum côté client | 2 Mio |
+| Maximum côté client | 2 Mio sur le web ; 1 Mio sur Android (plage encodée par le pont natif) |
 | Dernière tranche | Peut être plus petite que la taille courante |
 
 Après chaque succès, le client mesure le débit. Il vise une tranche qui prend environ quatre secondes à envoyer, l’arrondit au multiple de 64 Kio le plus proche, puis ajuste progressivement la taille. Il faut deux succès consécutifs pour augmenter la taille. En cas d’échec, elle retombe à 512 Kio.
@@ -137,7 +139,8 @@ Le serveur est la source de vérité sur l’avancement : `received_bytes`.
 - Après une erreur réseau, le client attend avec un délai croissant, demande `GET /api/uploads/<uuid>` et reprend depuis `receivedBytes`.
 - Une seule requête `PATCH` par session est active à la fois ; une nouvelle requête remplace l’ancienne si elle est restée bloquée.
 - Pause et annulation sont gérées par `UploadTask`. Une annulation supprime la session incomplète ; une simple coupure conserve la session.
-- Après fermeture/redémarrage de l’application, `localStorage` garde les métadonnées de l’envoi, pas les octets de la vidéo. L’utilisateur choisit à nouveau le fichier. Son empreinte est comparée, puis l’envoi reprend à l’offset du serveur.
+- Android stocke seulement URI, nom, MIME, taille, signature et ID de session dans les préférences privées natives. Après redémarrage, « Reprendre » relit directement l’URI si l’autorisation existe ; sinon l’application demande de choisir à nouveau le fichier.
+- Le navigateur ne persiste jamais le fichier. Tant que la page vit, il garde son objet `File` ; après rechargement il redemande le fichier. `localStorage` ne contient que des métadonnées, jamais un chemin présenté comme capable de rouvrir le fichier.
 - Les sessions sans activité sont nettoyées après 24 heures par défaut : [`backend/src/services/gc.service.js`](../backend/src/services/gc.service.js), réglage `UPLOAD_SESSION_TTL_HOURS`.
 
 Les principales fonctions du protocole se trouvent dans `UploadTask.#transfer()`, `UploadTask.#resync()` et `UploadTask.#complete()` dans `upload-task.js`.
@@ -195,9 +198,11 @@ Dans le navigateur ou WebView Android, `player.js` utilise `hls.js` si disponibl
 | Rôle | Fichier |
 |---|---|
 | Sélecteur, aperçu, fenêtre de publication et bulle de progression | `noteApp/www/js/ui/upload-ui.js` |
-| Lecture d’une tranche et empreinte | `noteApp/www/js/upload/source.js` |
-| SHA-256 de l’empreinte partielle | `noteApp/www/js/upload/sha256.js` |
-| Taille adaptative 512 Kio–2 Mio | `noteApp/www/js/upload/chunk-sizer.js` |
+| Sélecteur Android et accès URI persistant | `noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java` |
+| Pont JavaScript pour URI Android et plages bornées | `noteApp/www/js/upload/native-video-source.js` |
+| Lecture de plage et signature chaînée de tout le contenu | `noteApp/www/js/upload/source.js` |
+| SHA-256 de chaque bloc de signature | `noteApp/www/js/upload/sha256.js` |
+| Taille adaptative 512 Kio–2 Mio web, 512 Kio–1 Mio Android | `noteApp/www/js/upload/chunk-sizer.js` |
 | Session, tranches, pause, reprise, retry et fin | `noteApp/www/js/upload/upload-task.js` |
 | Requêtes HTTP `POST`, `GET`, `PATCH`, `complete`, `abort` | `noteApp/www/js/api-core.js` |
 | Déclaration des routes upload | `backend/src/routes/upload.routes.js` |
@@ -212,5 +217,5 @@ Dans le navigateur ou WebView Android, `player.js` utilise `hls.js` si disponibl
 
 ## Formulation courte pour l’expliquer à l’oral
 
-> « Le téléphone ne charge pas toute la vidéo en mémoire. Il lit le fichier par tranches de 512 Kio à 2 Mio et envoie chaque tranche en `PATCH`. Le backend écrit le flux directement dans un fichier temporaire et confirme l’offset dans PostgreSQL. En cas de coupure, le téléphone redemande l’offset confirmé et repart de là. Quand la taille reçue est complète, le backend renomme ce fichier dans le dossier source et met son ID dans une file FFmpeg. FFmpeg fabrique les qualités HLS et leurs segments sur le disque. Le lecteur reçoit la playlist HLS puis charge les segments nécessaires selon le débit réseau. »
+> « Le téléphone ne charge pas toute la vidéo en mémoire. Android conserve une URI accordée par le sélecteur système ; le navigateur garde son objet `File`. Le client lit des plages bornées, calcule une signature en parcourant le fichier bloc par bloc, puis envoie chaque tranche en `PATCH`. Le backend écrit les octets directement dans un fichier temporaire et confirme l’offset dans PostgreSQL. En cas de coupure, il reprend à l’offset confirmé. Quand le fichier est complet, le backend le déplace vers les sources et le passe à FFmpeg, qui fabrique les qualités HLS et leurs segments sur le disque. »
 

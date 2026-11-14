@@ -1,5 +1,6 @@
 export const MIN_CHUNK = 512 * 1024;
 export const MAX_CHUNK = 2 * 1024 * 1024;
+export const ANDROID_MAX_CHUNK = 1024 * 1024;
 const STEP = 256 * 1024;
 const TARGET_SECONDS = 4; // un morceau devrait durer ~4 s : assez court pour perdre peu en cas de coupure
 

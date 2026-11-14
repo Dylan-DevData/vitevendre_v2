@@ -11,7 +11,7 @@ Ce pense-bête indique **quel fichier fait quoi**, dans l’ordre. Le frontend l
    `FileSource.read(start, end)` utilise `file.slice(start, end)` pour lire seulement la plage demandée. Le frontend garde temporairement cette tranche en mémoire.
 
 3. **Choisir la taille** — `noteApp/www/js/upload/chunk-sizer.js`  
-   Commence à **512 Kio**, augmente si le réseau est stable, et ne dépasse pas **2 Mio**. En cas d’erreur, revient à 512 Kio.
+   Commence à **512 Kio**, augmente si le réseau est stable, et ne dépasse pas **2 Mio sur navigateur** ou **1 Mio sur Android**. En cas d’erreur, revient à 512 Kio.
 
 4. **Organiser l’upload et la reprise** — `noteApp/www/js/upload/upload-task.js`  
    Crée la session, lit une tranche, l’envoie, attend la confirmation du serveur, puis passe à la suivante. En cas de coupure, demande l’offset au serveur et reprend à cette position.

@@ -35,10 +35,12 @@
       "cordova-plugin-file": {},
       "cordova-plugin-network-information": {},
       "cordova-plugin-inappbrowser": {},
-      "cordova-plugin-statusbar": {}
+      "cordova-plugin-statusbar": {},
+      "com.vitevendre.persistent-video-source": {}
     }
   },
   "dependencies": {
+    "com.vitevendre.persistent-video-source": "file:cordova-plugins/vitevendre-persistent-video",
     "cordova-plugin-camera": "8.0.0",
     "cordova-plugin-file": "8.1.3",
     "cordova-plugin-inappbrowser": "7.0.0",

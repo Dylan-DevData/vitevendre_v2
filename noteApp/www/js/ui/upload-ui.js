@@ -1,14 +1,21 @@
 import { api } from '../api.js';
 import { UploadTask } from '../upload/upload-task.js';
+import { computeFingerprint, openSource } from '../upload/source.js';
+import {
+  isNativeAndroid, pickAndroidVideo, restoreAndroidVideo, saveAndroidPending,
+  loadAndroidPending, finishAndroidUpload, abandonAndroidUpload, releaseAndroidUri,
+  AndroidContentFile,
+} from '../upload/native-video-source.js';
 import { h, formatBytes, formatEta, toast } from './dom.js';
 import { icons } from './icons.js';
 
 const PENDING_KEY = 'vv.pending';
 const CIRCUMFERENCE = 2 * Math.PI * 18;
 const ALLOWED = ['video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp'];
+const nativeAndroid = isNativeAndroid();
 
-const loadPending = () => { try { return JSON.parse(localStorage.getItem(PENDING_KEY)); } catch (e) { return null; } };
-const savePending = (value) => {
+const loadWebPending = () => { try { return JSON.parse(localStorage.getItem(PENDING_KEY)); } catch (e) { return null; } };
+const saveWebPending = (value) => {
   try { if (value) localStorage.setItem(PENDING_KEY, JSON.stringify(value)); else localStorage.removeItem(PENDING_KEY); } catch (e) { /* ignoré */ }
 };
 
@@ -32,10 +39,34 @@ function ring() {
 export function createUploader({ onPublished, onViewProfile }) {
   let task = null;
   let lastFile = null;
-  let pending = loadPending();
+  // Android keeps only URI/metadata in native SharedPreferences; the browser stores metadata only.
+  let pending = nativeAndroid ? null : loadWebPending();
   let publishedVideoId = null;
   let pollTimer = null;
   let hideTimer = null;
+  let pendingLoaded = !nativeAndroid;
+
+  const ready = nativeAndroid
+    ? loadAndroidPending().then((saved) => {
+      pending = saved || null;
+      pendingLoaded = true;
+      if (pending && pending.status === 'processing' && pending.videoId) {
+        publishedVideoId = Number(pending.videoId);
+        watchProcessing(publishedVideoId);
+      }
+    }).catch((error) => {
+      pending = null;
+      pendingLoaded = true;
+      console.error('Impossible de lire la reprise Android :', error);
+    })
+    : Promise.resolve();
+
+  function persistPending(value) {
+    pending = value;
+    if (nativeAndroid) return value ? saveAndroidPending(value) : abandonAndroidUpload();
+    saveWebPending(value);
+    return Promise.resolve(value);
+  }
 
   // ---------- Bulle ----------
   const r = ring();
@@ -88,37 +119,81 @@ export function createUploader({ onPublished, onViewProfile }) {
         return show({ heading: 'Traitement de la vidéo…', detail: 'Création des qualités 240p → 1080p', fraction: 1, spin: true, glyph: icons.film, closable: false });
       case 'source-gone':
         return show({ heading: 'Fichier introuvable', detail: 'Il a été supprimé ou déplacé. Choisissez-le à nouveau pour reprendre.',
-          fraction, glyph: icons.close, tone: 'error', button: { label: 'Choisir', run: () => picker.click() } });
+          fraction, glyph: icons.close, tone: 'error', button: { label: 'Choisir', run: requestResumePicker } });
       case 'mismatch':
         return show({ heading: 'Ce n’est pas le même fichier', detail: 'Choisissez la vidéo d’origine pour reprendre.',
-          fraction, glyph: icons.close, tone: 'error', button: { label: 'Choisir', run: () => picker.click() } });
+          fraction, glyph: icons.close, tone: 'error', button: { label: 'Choisir', run: requestResumePicker } });
+      case 'source-unavailable':
+        return show({ heading: 'Vidéo inaccessible', detail: snap.error || 'Choisissez à nouveau le fichier vidéo.',
+          fraction, glyph: icons.close, tone: 'error', button: { label: 'Choisir à nouveau', run: requestResumePicker } });
       case 'error':
         return show({ heading: 'Envoi interrompu', detail: snap.error || 'Une erreur est survenue.', fraction, glyph: icons.retry, tone: 'error',
-          button: lastFile ? { label: 'Réessayer', run: () => begin(lastFile, pending && pending.caption, pending && pending.fingerprint) } : null });
+          button: lastFile ? { label: 'Réessayer', run: () => begin(lastFile, pending && pending.caption, pending && pending.fingerprint, pending && pending.uploadId, pending) } : { label: 'Reprendre', run: requestResume } });
       default:
     }
   }
 
-  function begin(file, caption, expectedFingerprint = null) {
+  function begin(file, caption, expectedFingerprint = null, resumeUploadId = null, existingPending = null) {
     lastFile = file;
     // La tâche émet ses états/progrès ; elle garde une seule tranche en mémoire à la fois.
-    task = new UploadTask({ file, caption, api, expectedFingerprint });
-    pending = { fileName: file.name, size: file.size, caption, fingerprint: expectedFingerprint, videoId: null };
-    savePending(pending);
+    const metadata = existingPending || {
+      uri: file.kind === 'android-content' ? file.uri : undefined,
+      name: file.name,
+      mimeType: file.type || 'video/mp4',
+      size: file.size,
+      caption,
+      fingerprint: expectedFingerprint || file.fingerprint || '',
+      uploadId: resumeUploadId || '',
+      videoId: null,
+      status: 'uploading',
+    };
+    metadata.status = 'uploading';
+    task = new UploadTask({
+      file, caption, api, expectedFingerprint, resumeUploadId,
+      onFingerprint: async (fingerprint) => {
+        metadata.fingerprint = fingerprint;
+        await persistPending(metadata);
+      },
+      onSession: async (session) => {
+        metadata.uploadId = session.uploadId;
+        metadata.videoId = session.videoId;
+        metadata.status = 'uploading';
+        await persistPending(metadata);
+      },
+    });
+    pending = metadata;
     const current = task;
     task.addEventListener('session', (event) => {
-      pending.fingerprint = event.detail.fingerprint;
-      pending.videoId = event.detail.videoId;
-      savePending(pending);
+      metadata.fingerprint = event.detail.fingerprint;
+      metadata.videoId = event.detail.videoId;
     });
-    task.addEventListener('state', (event) => { if (task === current) render(event.detail); });
+    task.addEventListener('state', (event) => {
+      if (task !== current) return;
+      render(event.detail);
+      if (event.detail.state === 'processing') {
+        metadata.status = 'processing';
+        metadata.videoId = event.detail.videoId;
+        if (nativeAndroid) {
+          // La source n'est plus requise une fois tous les octets validés par le backend.
+          finishAndroidUpload(metadata.videoId).then((saved) => { pending = saved; }).catch(console.error);
+        } else {
+          metadata.uri = undefined;
+          metadata.uploadId = '';
+          saveWebPending(metadata);
+        }
+      }
+    });
     task.addEventListener('progress', (event) => { if (task === current) render(event.detail); });
     render(task.snapshot());
-    task.start().then((result) => {
+    // Persiste l'URI et les métadonnées avant la première lecture de tranche ou requête réseau.
+    persistPending(metadata).then(() => current.start()).then((result) => {
       if (!result || task !== current) return;
       publishedVideoId = result.videoId;
       watchProcessing(result.videoId);
-    }).catch(() => { /* l'état d'erreur est déjà affiché par la bulle */ });
+    }).catch((error) => {
+      if (task === current && current.state === 'idle') render({ ...current.snapshot(), state: 'error', error: error.message });
+      // Les erreurs de la tâche sont déjà affichées par la bulle.
+    });
   }
 
   // Filet de sécurité si le flux temps réel est coupé : on interroge le serveur toutes les 4 s.
@@ -134,13 +209,13 @@ export function createUploader({ onPublished, onViewProfile }) {
     }, 4000);
   }
 
-  // Événements temps réel (SSE) poussés par le serveur.
+  // Événements temps réel (WebSocket) poussés par le serveur.
   // Les événements video.ready/failed font passer la bulle de « traitement » à son résultat.
   function handleEvent(name, data) {
     if (data.videoId !== publishedVideoId && !(pending && data.videoId === pending.videoId)) return;
     if (name === 'video.ready') {
       clearInterval(pollTimer);
-      savePending(null); pending = null; task = null;
+      persistPending(null).catch(console.error); pending = null; task = null;
       show({ heading: 'Vidéo publiée', detail: `Qualités prêtes : ${(data.renditions || []).join(', ')}`, fraction: 1, glyph: icons.check, tone: 'ok',
         button: { label: 'Voir', run: () => { hideBubble(); onViewProfile(); } } });
       hideTimer = setTimeout(hideBubble, 9000);
@@ -149,7 +224,7 @@ export function createUploader({ onPublished, onViewProfile }) {
       sub.textContent = `Qualités prêtes : ${data.renditions.join(', ')}`;
     } else if (name === 'video.failed') {
       clearInterval(pollTimer);
-      savePending(null); pending = null; task = null;
+      persistPending(null).catch(console.error); pending = null; task = null;
       show({ heading: 'Traitement impossible', detail: 'La vidéo n’a pas pu être convertie. Essayez un autre fichier.', glyph: icons.close, tone: 'error' });
     }
   }
@@ -162,13 +237,14 @@ export function createUploader({ onPublished, onViewProfile }) {
   });
   closeButton.addEventListener('click', async () => {
     if (task && !['processing'].includes(task.state)) await task.cancel();
-    savePending(null); pending = null; task = null; lastFile = null;
+    else if (pending && pending.uploadId && pending.status !== 'processing') await api.abortUpload(pending.uploadId).catch(() => {});
+    await persistPending(null).catch(console.error); pending = null; task = null; lastFile = null;
     hideBubble();
   });
   picker.addEventListener('change', () => {
     const file = picker.files && picker.files[0];
     picker.value = '';
-    if (file && pending) begin(file, pending.caption, pending.fingerprint);
+    if (file && pending) begin(file, pending.caption, pending.fingerprint, pending.uploadId, pending);
   });
 
   // ---------- Fenêtre de création (+) ----------
@@ -192,34 +268,58 @@ export function createUploader({ onPublished, onViewProfile }) {
       h('div', { class: 'sheet-buttons' }, cancel, publish)));
 
   function closeSheet() {
+    const abandonedChoice = chosen;
     sheet.classList.add('hidden');
     if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
     chosen = null; preview.replaceChildren(); preview.classList.add('hidden');
     caption.value = ''; publish.disabled = true; pickButton.classList.remove('hidden');
+    // Fermer avant publication abandonne la sélection Android et libère son accès persistant.
+    if (abandonedChoice instanceof AndroidContentFile && !task) persistPending(null).catch(console.error);
   }
-  pickButton.addEventListener('click', () => input.click());
+
+  function useChosenFile(file) {
+    if (!file) return;
+    if (file.type && !ALLOWED.includes(file.type)) { toast('Format non pris en charge (MP4, MOV, WebM ou 3GP).'); return; }
+    const oldChoice = chosen;
+    if (oldChoice instanceof AndroidContentFile && oldChoice.uri !== file.uri) releaseAndroidUri(oldChoice.uri).catch(() => {});
+    chosen = file;
+    if (file.kind === 'android-content') {
+      // L'aperçu Android montre les métadonnées ; la vidéo reste derrière l'URI content://.
+      preview.replaceChildren(h('div', { class: 'preview-info' },
+        h('b', {}, file.name || 'video'), h('span', {}, formatBytes(file.size))));
+      persistPending({
+        uri: file.uri, name: file.name, mimeType: file.type, size: file.size,
+        fingerprint: '', uploadId: '', videoId: null, caption: caption.value.trim(), status: 'selected',
+      }).catch((error) => toast(error.message));
+    } else {
+      // URL.createObjectURL référence le fichier navigateur sans le convertir en Base64.
+      previewUrl = URL.createObjectURL(file);
+      preview.replaceChildren(
+        h('video', { src: previewUrl, muted: true, playsinline: true, preload: 'metadata' }),
+        h('div', { class: 'preview-info' }, h('b', {}, file.name || 'video'), h('span', {}, formatBytes(file.size))));
+    }
+    preview.classList.remove('hidden');
+    pickButton.classList.add('hidden');
+    publish.disabled = false;
+  }
+
+  pickButton.addEventListener('click', async () => {
+    if (!nativeAndroid) { input.click(); return; }
+    try { useChosenFile(await pickAndroidVideo()); }
+    catch (error) { if (error.code !== 'PICKER_CANCELLED') toast(error.message); }
+  });
   input.addEventListener('change', () => {
     // Le sélecteur système remet le File ici. Sa taille/type sont des métadonnées du fichier.
     const file = input.files && input.files[0];
     input.value = '';
-    if (!file) return;
-    if (file.type && !ALLOWED.includes(file.type)) { toast('Format non pris en charge (MP4, MOV, WebM ou 3GP).'); return; }
-    chosen = file;
-    // URL.createObjectURL référence le fichier local pour l'aperçu, sans le convertir en Base64.
-    previewUrl = URL.createObjectURL(file);
-    preview.replaceChildren(
-      h('video', { src: previewUrl, muted: true, playsinline: true, preload: 'metadata' }),
-      h('div', { class: 'preview-info' }, h('b', {}, file.name || 'video'), h('span', {}, formatBytes(file.size))));
-    preview.classList.remove('hidden');
-    pickButton.classList.add('hidden');
-    publish.disabled = false;
+    useChosenFile(file);
   });
   cancel.addEventListener('click', closeSheet);
   sheet.querySelector('.sheet-backdrop').addEventListener('click', closeSheet);
   publish.addEventListener('click', () => {
     if (!chosen) return;
-    // Passe la référence File à UploadTask : elle lira plus tard des plages avec file.slice().
     const file = chosen; const text = caption.value.trim();
+    chosen = null; // Le flux appartient maintenant à UploadTask, pas à la fenêtre de création.
     closeSheet();
     begin(file, text);
   });
@@ -227,17 +327,72 @@ export function createUploader({ onPublished, onViewProfile }) {
   // Après un redémarrage de l'app : on montre l'envoi interrompu et on propose de reprendre.
   function showInterrupted() {
     if (!pending || task) return;
-    show({ heading: 'Envoi interrompu', detail: `${pending.fileName} · choisissez à nouveau la vidéo pour reprendre`, glyph: icons.upload, tone: 'warn',
-      button: { label: 'Reprendre', run: () => picker.click() } });
+    if (pending.status === 'processing' && pending.videoId) {
+      show({ heading: 'Traitement de la vidéo…', detail: 'L’envoi est terminé ; le serveur prépare les qualités HLS.', fraction: 1, spin: true, glyph: icons.film, closable: false });
+      return;
+    }
+    show({ heading: 'Envoi interrompu', detail: `${pending.name || pending.fileName || 'Vidéo'} · appuie sur Reprendre pour continuer`, glyph: icons.upload, tone: 'warn',
+      button: { label: 'Reprendre', run: requestResume } });
+  }
+
+  async function requestResume() {
+    if (!pending) return;
+    if (!nativeAndroid) { picker.click(); return; }
+    if (!pending.uri) {
+      show({ heading: 'Vidéo à resélectionner', detail: 'L’URI enregistrée est absente. Choisis à nouveau le fichier.', tone: 'warn',
+        button: { label: 'Choisir', run: requestResumePicker } });
+      return;
+    }
+    try {
+      // Essaie d'abord l'URI persistée : l'utilisateur n'a pas à refaire le choix système.
+      begin(restoreAndroidVideo(pending), pending.caption || '', pending.fingerprint || null,
+        pending.uploadId || null, pending);
+    } catch (error) {
+      show({ heading: 'Vidéo inaccessible', detail: error.message, tone: 'error',
+        button: { label: 'Choisir à nouveau', run: requestResumePicker } });
+    }
+  }
+
+  async function requestResumePicker() {
+    if (!nativeAndroid) { picker.click(); return; }
+    let replacement;
+    try {
+      replacement = await pickAndroidVideo();
+      // Compare la signature avant de remplacer les métadonnées de la session en attente.
+      const signature = await computeFingerprint(openSource(replacement));
+      if (pending && pending.fingerprint && signature !== pending.fingerprint) {
+        if (replacement.uri !== pending.uri) await releaseAndroidUri(replacement.uri).catch(() => {});
+        show({ heading: 'Ce n’est pas la même vidéo', detail: 'Le fichier choisi ne correspond pas à l’envoi interrompu.', tone: 'error',
+          button: { label: 'Réessayer', run: requestResumePicker } });
+        return;
+      }
+      const previousUri = pending && pending.uri;
+      const metadata = {
+        ...(pending || {}), uri: replacement.uri, name: replacement.name, mimeType: replacement.type,
+        size: replacement.size, fingerprint: signature, status: 'uploading',
+      };
+      await persistPending(metadata);
+      if (previousUri && previousUri !== replacement.uri) await releaseAndroidUri(previousUri).catch(() => {});
+      begin(replacement, metadata.caption || '', signature, metadata.uploadId || null, metadata);
+    } catch (error) {
+      if (replacement && (!pending || replacement.uri !== pending.uri)) await releaseAndroidUri(replacement.uri).catch(() => {});
+      show({ heading: 'Impossible de lire cette vidéo', detail: error.message, tone: 'error',
+        button: { label: 'Choisir à nouveau', run: requestResumePicker } });
+    }
   }
 
   return {
     elements: [bubble, sheet, picker, input],
     openComposer() {
+      if (!pendingLoaded) { toast('Chargement de l’envoi en attente…'); return; }
       if (task && !['error', 'source-gone', 'mismatch', 'cancelled'].includes(task.state)) { toast('Un envoi est déjà en cours.'); return; }
+      if (pending && pending.status !== 'processing') { toast('Reprends ou abandonne d’abord l’envoi en attente.'); showInterrupted(); return; }
       sheet.classList.remove('hidden');
     },
     handleEvent,
     showInterrupted,
+    ready,
   };
 }
+
+

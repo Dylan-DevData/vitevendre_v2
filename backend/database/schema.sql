@@ -43,8 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_videos_processing ON videos (id) WHERE status = '
 -- ---------- Sessions d'envoi (upload reprenable par offset) ----------
 -- Le serveur est la seule source de vérité : received_bytes = nombre d'octets
 -- déjà écrits (en append) dans uploads/sessions/<id>.tmp.
--- fingerprint = empreinte du fichier (taille + hash des premiers/derniers Ko),
--- indépendante du nom : un même fichier renommé reprend la même session.
+-- fingerprint = signature chaînée de blocs de contenu + taille totale,
+-- indépendante du nom : les blocs sont lus bornés en mémoire pour reconnaître le fichier.
 CREATE TABLE IF NOT EXISTS uploads (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

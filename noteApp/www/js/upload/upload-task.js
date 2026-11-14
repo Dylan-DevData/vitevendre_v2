@@ -1,6 +1,7 @@
 import { ApiError } from '../api-core.js';
-import { ChunkSizer } from './chunk-sizer.js';
+import { ChunkSizer, MAX_CHUNK, ANDROID_MAX_CHUNK } from './chunk-sizer.js';
 import { SourceGoneError, computeFingerprint, openSource } from './source.js';
+import { NativeSourceError } from './native-video-source.js';
 
 // États : idle, hashing, uploading, waiting-network, paused, processing, source-gone,
 //         mismatch, error, cancelled.
@@ -23,14 +24,19 @@ function defaultEnv() {
 }
 
 export class UploadTask extends EventTarget {
-  constructor({ file, caption = '', api, env = defaultEnv(), expectedFingerprint = null }) {
+  constructor({ file, caption = '', api, env = defaultEnv(), expectedFingerprint = null, resumeUploadId = null,
+    onFingerprint = async () => {}, onSession = async () => {} }) {
     super();
     this.file = file;
     this.caption = caption;
     this.api = api;
     this.env = env;
     this.expectedFingerprint = expectedFingerprint;
-    this.sizer = new ChunkSizer();
+    // Android SAF uses a Base64 bridge, so cap its payload at 1 Mio; browsers can grow to 2 Mio.
+    this.sizer = new ChunkSizer({ max: file && file.kind === 'android-content' ? ANDROID_MAX_CHUNK : MAX_CHUNK });
+    this.resumeUploadId = resumeUploadId;
+    this.onFingerprint = onFingerprint;
+    this.onSession = onSession;
     this.state = 'idle';
     this.error = null;
     this.uploadId = null;
@@ -107,18 +113,43 @@ export class UploadTask extends EventTarget {
         this.#setState('mismatch', error.message);
         throw error;
       }
+      await this.onFingerprint(this.fingerprint);
 
-      // Ce POST ne transporte que les métadonnées ; les octets vidéo partent ensuite par PATCH.
-      const session = await this.#retry(() => this.api.createUpload({
-        mime_type: source.type || 'video/mp4',
-        total_size: source.size,
-        fingerprint: this.fingerprint,
-        caption: this.caption,
-      }));
+      // Après un redémarrage Android, privilégie l'identifiant persisté ; sinon le POST déduplique
+      // une session active par empreinte (utile également au navigateur après nouvelle sélection).
+      let session = null;
+      if (this.resumeUploadId) {
+        try {
+          session = await this.#retry(() => this.api.getUpload(this.resumeUploadId));
+          if (session.totalSize !== source.size) throw new Error('La taille de la vidéo ne correspond plus à la session en attente.');
+          if (session.status === 'complete') {
+            this.uploadId = session.uploadId;
+            this.videoId = session.videoId;
+            this.sent = source.size;
+            await this.onSession(session);
+            this.#setState('processing');
+            return { videoId: this.videoId, alreadyComplete: true };
+          }
+          if (session.status !== 'in_progress') throw new Error('La session d’envoi n’est plus active.');
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 404) throw error;
+          session = null; // session expirée côté serveur : le POST en créera une nouvelle.
+        }
+      }
+      if (!session) {
+        // Ce POST ne transporte que les métadonnées ; les octets vidéo partent ensuite par PATCH.
+        session = await this.#retry(() => this.api.createUpload({
+          mime_type: source.type || 'video/mp4',
+          total_size: source.size,
+          fingerprint: this.fingerprint,
+          caption: this.caption,
+        }));
+      }
       if (this.cancelled) return null;
       this.uploadId = session.uploadId;
       this.videoId = session.videoId;
       this.sent = session.receivedBytes;
+      await this.onSession(session);
       this.dispatchEvent(new CustomEvent('session', { detail: this.snapshot() }));
 
       await this.#transfer(source);
@@ -134,6 +165,8 @@ export class UploadTask extends EventTarget {
         // Fichier supprimé/déplacé pendant la pause : on arrête proprement. La session
         // reste sur le serveur (reprise possible avec le même fichier, 24 h).
         this.#setState('source-gone', error.message);
+      } else if (error instanceof NativeSourceError) {
+        this.#setState('source-unavailable', error.message);
       } else if (!['mismatch'].includes(this.state)) {
         this.#setState('error', error.message || 'Envoi impossible.');
       }

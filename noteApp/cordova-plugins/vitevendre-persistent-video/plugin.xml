@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+    id="com.vitevendre.persistent-video-source"
+    version="1.0.0">
+    <name>ViteVendrePersistentVideoSource</name>
+    <description>Choix Android d'une vidéo par URI persistante et lecture de plages bornées.</description>
+    <license>Apache-2.0</license>
+
+    <js-module src="www/vv-video-source.js" name="VvVideoSource">
+        <clobbers target="cordova.plugins.vvVideoSource" />
+    </js-module>
+
+    <platform name="android">
+        <config-file target="res/xml/config.xml" parent="/*">
+            <feature name="VvVideoSource">
+                <param name="android-package" value="com.vitevendre.videosource.VvVideoSource" />
+            </feature>
+        </config-file>
+        <source-file src="src/android/VvVideoSource.java" target-dir="src/com/vitevendre/videosource" />
+    </platform>
+</plugin>

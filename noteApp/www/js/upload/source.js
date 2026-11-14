@@ -1,4 +1,5 @@
 import { digestHex } from './sha256.js';
+import { AndroidContentFile } from './native-video-source.js';
 
 // Le fichier source a disparu (supprimé, déplacé, droits retirés) ou a changé.
 export class SourceGoneError extends Error {
@@ -59,22 +60,25 @@ export class FileSource {
 }
 
 export function openSource(file) {
+  // Android SAF supplies a content:// URI; its native bridge reads bounded ranges from that URI.
+  if (file instanceof AndroidContentFile) return file;
   return new FileSource(file);
 }
 
-const EDGE = 64 * 1024;
+const SIGNATURE_BLOCK_BYTES = 512 * 1024;
 
-// Empreinte légère : SHA-256 des 64 premiers Ko + 64 derniers Ko + taille exacte.
-// Le NOM n'entre pas dans le calcul : renommer le fichier ne change pas l'empreinte.
+// Signature complète et bornée en mémoire : on hache chaque bloc de 512 Kio, puis on
+// chaîne son SHA-256 au précédent. Toute la vidéo est vérifiée, sans jamais la charger entière.
+// Le nom n'entre pas dans le calcul : renommer le fichier ne change pas la signature.
 export async function computeFingerprint(source) {
   const size = source.size;
-  // Empreinte légère pour retrouver une session : tête + queue + taille, pas le fichier complet.
-  const head = await source.read(0, Math.min(EDGE, size));
-  const tail = size > EDGE ? await source.read(Math.max(EDGE, size - EDGE), size) : new Uint8Array(0);
-  const suffix = new TextEncoder().encode(`:${size}`);
-  const data = new Uint8Array(head.length + tail.length + suffix.length);
-  data.set(head, 0);
-  data.set(tail, head.length);
-  data.set(suffix, head.length + tail.length);
-  return digestHex(data);
+  const encoder = new TextEncoder();
+  let chain = await digestHex(encoder.encode(`vitevendre-upload-v1:${size}`));
+  for (let start = 0; start < size; start += SIGNATURE_BLOCK_BYTES) {
+    const end = Math.min(start + SIGNATURE_BLOCK_BYTES, size);
+    const block = await source.read(start, end);
+    const blockHash = await digestHex(block);
+    chain = await digestHex(encoder.encode(`${chain}:${blockHash}`));
+  }
+  return chain;
 }

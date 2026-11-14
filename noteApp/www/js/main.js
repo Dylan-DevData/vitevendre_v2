@@ -126,7 +126,8 @@ function showApp() {
   stopNetwork = subscribeNetwork((snapshot) => offline.classList.toggle('hidden', snapshot.online));
 
   show('home');
-  uploader.showInterrupted();
+  // Android charge ses métadonnées persistantes de reprise avant d'afficher le bouton Reprendre.
+  uploader.ready.then(() => uploader.showInterrupted());
 }
 
 window.addEventListener('vv:logout', showAuth);
