@@ -23,6 +23,14 @@ export class ChunkSizer {
     return this.size;
   }
 
+  setMax(max) {
+    const limit = Math.floor(Number(max));
+    if (!Number.isSafeInteger(limit) || limit < 1) return;
+    this.max = Math.min(this.max, limit);
+    this.min = Math.min(this.min, this.max);
+    this.size = clamp(this.size, this.min, this.max);
+  }
+
   onSuccess(bytes, milliseconds) {
     // Mesure le débit puis le lisse pour éviter de réagir exagérément à un seul ralentissement.
     const instant = bytes / Math.max(milliseconds, 1) * 1000;

@@ -1,23 +1,17 @@
 import { api } from '../api.js';
 import { UploadTask } from '../upload/upload-task.js';
-import { computeFingerprint, openSource } from '../upload/source.js';
+import { uploadStorage } from '../upload/storage.js';
+import { FINGERPRINT_SCHEME, computeFingerprint, openSource } from '../upload/source.js';
 import {
-  isNativeAndroid, pickAndroidVideo, restoreAndroidVideo, saveAndroidPending,
-  loadAndroidPending, finishAndroidUpload, abandonAndroidUpload, releaseAndroidUri,
+  isNativeAndroid, pickAndroidVideo, restoreAndroidVideo, releaseAndroidUri,
   AndroidContentFile,
 } from '../upload/native-video-source.js';
 import { h, formatBytes, formatEta, toast } from './dom.js';
 import { icons } from './icons.js';
 
-const PENDING_KEY = 'vv.pending';
 const CIRCUMFERENCE = 2 * Math.PI * 18;
 const ALLOWED = ['video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp'];
 const nativeAndroid = isNativeAndroid();
-
-const loadWebPending = () => { try { return JSON.parse(localStorage.getItem(PENDING_KEY)); } catch (e) { return null; } };
-const saveWebPending = (value) => {
-  try { if (value) localStorage.setItem(PENDING_KEY, JSON.stringify(value)); else localStorage.removeItem(PENDING_KEY); } catch (e) { /* ignoré */ }
-};
 
 function ring() {
   const ns = 'http://www.w3.org/2000/svg';
@@ -39,16 +33,16 @@ function ring() {
 export function createUploader({ onPublished, onViewProfile }) {
   let task = null;
   let lastFile = null;
-  // Android keeps only URI/metadata in native SharedPreferences; the browser stores metadata only.
-  let pending = nativeAndroid ? null : loadWebPending();
+  // IndexedDB conserve les métadonnées d'envoi et les références URI sur toutes les plateformes.
+  let pending = null;
   let publishedVideoId = null;
   let pollTimer = null;
   let hideTimer = null;
-  let pendingLoaded = !nativeAndroid;
+  let pendingLoaded = false;
 
-  const ready = nativeAndroid
-    ? loadAndroidPending().then((saved) => {
-      pending = saved || null;
+  const ready = uploadStorage.all().then((records) => {
+      pending = records.filter((record) => !['completed', 'cancelled'].includes(record.status))
+        .sort((a, b) => b.updatedAt - a.updatedAt)[0] || null;
       pendingLoaded = true;
       if (pending && pending.status === 'processing' && pending.videoId) {
         publishedVideoId = Number(pending.videoId);
@@ -58,14 +52,22 @@ export function createUploader({ onPublished, onViewProfile }) {
       pending = null;
       pendingLoaded = true;
       console.error('Impossible de lire la reprise Android :', error);
-    })
-    : Promise.resolve();
+    });
 
   function persistPending(value) {
+    if (!value) {
+      const previousId = pending && pending.id;
+      pending = null;
+      const cleanup = previousId ? uploadStorage.remove(previousId) : Promise.resolve();
+      return cleanup;
+    }
     pending = value;
-    if (nativeAndroid) return value ? saveAndroidPending(value) : abandonAndroidUpload();
-    saveWebPending(value);
-    return Promise.resolve(value);
+    value.id ||= (globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    value.uriType = value.uri ? 'content' : 'file';
+    value.uploadSessionId = value.uploadId || '';
+    value.uploadedBytes = value.uploadedBytes || 0;
+    const indexed = uploadStorage.put(value);
+    return indexed;
   }
 
   // ---------- Bulle ----------
@@ -149,13 +151,17 @@ export function createUploader({ onPublished, onViewProfile }) {
     };
     metadata.status = 'uploading';
     task = new UploadTask({
-      file, caption, api, expectedFingerprint, resumeUploadId,
+      file, caption, api, expectedFingerprint,
+      expectedFingerprintScheme: existingPending?.fingerprintScheme || null,
+      resumeUploadId,
       onFingerprint: async (fingerprint) => {
         metadata.fingerprint = fingerprint;
+        metadata.fingerprintScheme = FINGERPRINT_SCHEME;
         await persistPending(metadata);
       },
       onSession: async (session) => {
         metadata.uploadId = session.uploadId;
+        metadata.uploadSessionId = session.uploadId;
         metadata.videoId = session.videoId;
         metadata.status = 'uploading';
         await persistPending(metadata);
@@ -173,17 +179,16 @@ export function createUploader({ onPublished, onViewProfile }) {
       if (event.detail.state === 'processing') {
         metadata.status = 'processing';
         metadata.videoId = event.detail.videoId;
-        if (nativeAndroid) {
-          // La source n'est plus requise une fois tous les octets validés par le backend.
-          finishAndroidUpload(metadata.videoId).then((saved) => { pending = saved; }).catch(console.error);
-        } else {
-          metadata.uri = undefined;
-          metadata.uploadId = '';
-          saveWebPending(metadata);
-        }
+        // Garder la fiche IndexedDB pendant le traitement; libérer l'autorisation Android après l'état prêt.
+        uploadStorage.put(metadata).catch(console.error);
       }
     });
-    task.addEventListener('progress', (event) => { if (task === current) render(event.detail); });
+    task.addEventListener('progress', (event) => {
+      if (task !== current) return;
+      metadata.uploadedBytes = event.detail.sent;
+      uploadStorage.put(metadata).catch(console.error);
+      render(event.detail);
+    });
     render(task.snapshot());
     // Persiste l'URI et les métadonnées avant la première lecture de tranche ou requête réseau.
     persistPending(metadata).then(() => current.start()).then((result) => {
@@ -215,6 +220,7 @@ export function createUploader({ onPublished, onViewProfile }) {
     if (data.videoId !== publishedVideoId && !(pending && data.videoId === pending.videoId)) return;
     if (name === 'video.ready') {
       clearInterval(pollTimer);
+      if (pending && pending.uri) releaseAndroidUri(pending.uri).catch(() => {});
       persistPending(null).catch(console.error); pending = null; task = null;
       show({ heading: 'Vidéo publiée', detail: `Qualités prêtes : ${(data.renditions || []).join(', ')}`, fraction: 1, glyph: icons.check, tone: 'ok',
         button: { label: 'Voir', run: () => { hideBubble(); onViewProfile(); } } });
@@ -288,6 +294,7 @@ export function createUploader({ onPublished, onViewProfile }) {
       preview.replaceChildren(h('div', { class: 'preview-info' },
         h('b', {}, file.name || 'video'), h('span', {}, formatBytes(file.size))));
       persistPending({
+        id: globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
         uri: file.uri, name: file.name, mimeType: file.type, size: file.size,
         fingerprint: '', uploadId: '', videoId: null, caption: caption.value.trim(), status: 'selected',
       }).catch((error) => toast(error.message));
@@ -360,7 +367,7 @@ export function createUploader({ onPublished, onViewProfile }) {
       replacement = await pickAndroidVideo();
       // Compare la signature avant de remplacer les métadonnées de la session en attente.
       const signature = await computeFingerprint(openSource(replacement));
-      if (pending && pending.fingerprint && signature !== pending.fingerprint) {
+      if (pending?.fingerprintScheme === FINGERPRINT_SCHEME && pending.fingerprint && signature !== pending.fingerprint) {
         if (replacement.uri !== pending.uri) await releaseAndroidUri(replacement.uri).catch(() => {});
         show({ heading: 'Ce n’est pas la même vidéo', detail: 'Le fichier choisi ne correspond pas à l’envoi interrompu.', tone: 'error',
           button: { label: 'Réessayer', run: requestResumePicker } });
@@ -368,8 +375,9 @@ export function createUploader({ onPublished, onViewProfile }) {
       }
       const previousUri = pending && pending.uri;
       const metadata = {
-        ...(pending || {}), uri: replacement.uri, name: replacement.name, mimeType: replacement.type,
-        size: replacement.size, fingerprint: signature, status: 'uploading',
+        ...(pending || {}), id: (pending && pending.id) || (globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+        uri: replacement.uri, name: replacement.name, mimeType: replacement.type,
+        size: replacement.size, fingerprint: signature, fingerprintScheme: FINGERPRINT_SCHEME, status: 'uploading',
       };
       await persistPending(metadata);
       if (previousUri && previousUri !== replacement.uri) await releaseAndroidUri(previousUri).catch(() => {});

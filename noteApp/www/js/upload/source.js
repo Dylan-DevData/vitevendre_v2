@@ -60,17 +60,19 @@ export class FileSource {
 }
 
 export function openSource(file) {
-  // Android SAF supplies a content:// URI; its native bridge reads bounded ranges from that URI.
+  // Le sélecteur SAF Android fournit une URI content://; le pont natif lit des plages bornées depuis cette URI.
   if (file instanceof AndroidContentFile) return file;
   return new FileSource(file);
 }
 
+export const FINGERPRINT_SCHEME = 'content-chain-v1';
 const SIGNATURE_BLOCK_BYTES = 512 * 1024;
 
-// Signature complète et bornée en mémoire : on hache chaque bloc de 512 Kio, puis on
-// chaîne son SHA-256 au précédent. Toute la vidéo est vérifiée, sans jamais la charger entière.
-// Le nom n'entre pas dans le calcul : renommer le fichier ne change pas la signature.
+// Hache chaque octet par blocs bornés de 512 Kio. Android effectue ce calcul dans le pont natif,
+// ce qui évite des centaines d'allers-retours Cordova et de conversions Base64; les autres
+// plateformes lisent les blocs avec File.slice().
 export async function computeFingerprint(source) {
+  if (source instanceof AndroidContentFile) return source.computeFingerprint();
   const size = source.size;
   const encoder = new TextEncoder();
   let chain = await digestHex(encoder.encode(`vitevendre-upload-v1:${size}`));

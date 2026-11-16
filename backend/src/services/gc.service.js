@@ -4,10 +4,10 @@ const uploadModel = require('../models/upload.model');
 const { sessionsDir, uploadSessionTtlHours, gcIntervalMinutes } = require('../config/env');
 const logger = require('../utils/logger');
 
-// Garbage collector des envois abandonnés.
-//  1. Sessions "in_progress" sans activité depuis plus de TTL heures (24 h par défaut) :
-//     le fichier .tmp et la ligne en base sont supprimés.
-//  2. Fichiers .tmp orphelins (sans session active) plus vieux que le TTL.
+// Nettoyage périodique des envois abandonnés.
+//  1. Supprime les sessions « in_progress » sans activité depuis plus longtemps que le TTL
+//     (24 heures par défaut), ainsi que leur fichier temporaire et leur ligne en base.
+//  2. Supprime les fichiers .tmp orphelins sans session active lorsqu'ils dépassent le TTL.
 async function collect() {
   let sessions = 0;
   let orphans = 0;

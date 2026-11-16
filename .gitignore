@@ -14,6 +14,7 @@ backend/media/
 # Fichiers générés Cordova (très lourds, regénérés via cordova prepare)
 noteApp/platforms/
 noteApp/plugins/
+noteApp/.gradle-user/
 
 # Logs et temporaires
 npm-debug.log*

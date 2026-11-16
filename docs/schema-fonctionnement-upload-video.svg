@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1740" viewBox="0 0 1500 1740" role="img" aria-labelledby="title desc">
+  <title id="title">Parcours séquentiel de l’upload vidéo ViteVendre</title>
+  <desc id="desc">Diagramme numéroté de la sélection de vidéos Android à l’envoi par morceaux, la reprise réseau, la conversion HLS et le nettoyage IndexedDB.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M1 1 L11 6 L1 11 Z" fill="#64748b"/></marker>
+    <marker id="blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M1 1 L11 6 L1 11 Z" fill="#1479e8"/></marker>
+    <style>
+      text{font-family:Arial,Helvetica,sans-serif;fill:#172033}.title{font-size:34px;font-weight:700}.sub{font-size:18px;fill:#526078}
+      .head{font-size:21px;font-weight:700}.body{font-size:17px;fill:#394960}.small{font-size:15px;fill:#526078}
+      .num{font-size:22px;font-weight:700;fill:white;text-anchor:middle}.card{fill:white;stroke:#bfd0e2;stroke-width:2;rx:16}
+      .bluecard{fill:#eff6ff;stroke:#93c5fd}.greencard{fill:#f0fdf4;stroke:#86efac}.purplecard{fill:#f5f3ff;stroke:#c4b5fd}
+      .orangecard{fill:#fff7ed;stroke:#fdba74}.line{fill:none;stroke:#64748b;stroke-width:4;marker-end:url(#arrow)}
+      .blueline{fill:none;stroke:#1479e8;stroke-width:4;marker-end:url(#blue)}.dash{stroke-dasharray:10 8}
+    </style>
+  </defs>
+  <rect width="1500" height="1740" fill="#f8fafc"/>
+  <text x="55" y="62" class="title">Upload vidéo ViteVendre — parcours dans l’ordre</text>
+  <text x="55" y="96" class="sub">Du choix sur le téléphone à la publication HLS, puis le cas de reprise réseau</text>
+
+  <!-- Straight sequential path -->
+  <rect x="170" y="130" width="900" height="112" class="card bluecard"/>
+  <circle cx="220" cy="170" r="25" fill="#2563eb"/><text x="220" y="178" class="num">1</text>
+  <text x="265" y="169" class="head">L’utilisateur choisit une ou plusieurs vidéos</text>
+  <text x="205" y="207" class="body">Android ouvre le sélecteur système; chaque vidéo sélectionnée aura sa propre tâche.</text>
+  <path d="M620 242 V270" class="line"/>
+
+  <rect x="170" y="280" width="900" height="126" class="card greencard"/>
+  <circle cx="220" cy="320" r="25" fill="#16a34a"/><text x="220" y="328" class="num">2</text>
+  <text x="265" y="319" class="head">Android renvoie une URI et accorde l’accès</text>
+  <text x="205" y="357" class="body">Exemple : content://…/video/125. Le plugin vérifie la permission et lit les métadonnées.</text>
+  <text x="205" y="383" class="small">Cette URI est une référence Android; le plugin l’ouvre avec ContentResolver.</text>
+  <path d="M620 406 V434" class="line"/>
+
+  <rect x="170" y="444" width="900" height="126" class="card orangecard"/>
+  <circle cx="220" cy="484" r="25" fill="#ea7a18"/><text x="220" y="492" class="num">3</text>
+  <text x="265" y="483" class="head">L’application crée une fiche par vidéo</text>
+  <text x="205" y="521" class="body">IndexedDB conserve l’id de tâche, l’URI, le nom, la taille, l’état et la session serveur.</text>
+  <text x="205" y="547" class="small">La vidéo, l’objet File et les Blob ne sont pas enregistrés dans IndexedDB.</text>
+  <path d="M620 570 V598" class="line"/>
+
+  <rect x="170" y="608" width="900" height="126" class="card greencard"/>
+  <circle cx="220" cy="648" r="25" fill="#16a34a"/><text x="220" y="656" class="num">4</text>
+  <text x="265" y="647" class="head">Android calcule l’empreinte du fichier</text>
+  <text x="205" y="685" class="body">Le plugin lit des blocs de 512 Kio et vérifie l’identité de la source.</text>
+  <text x="205" y="711" class="small">Un tampon borné est utilisé; la vidéo complète n’est pas chargée en mémoire.</text>
+  <path d="M620 734 V762" class="line"/>
+
+  <rect x="170" y="772" width="900" height="126" class="card purplecard"/>
+  <circle cx="220" cy="812" r="25" fill="#7047d1"/><text x="220" y="820" class="num">5</text>
+  <text x="265" y="811" class="head">Le client demande une session au serveur</text>
+  <text x="205" y="849" class="body">POST /api/uploads envoie les métadonnées nécessaires, pas les octets vidéo.</text>
+  <text x="205" y="875" class="small">Express renvoie un uploadId propre à cette vidéo; la tâche le sauvegarde dans IndexedDB.</text>
+  <path d="M620 898 V926" class="line"/>
+
+  <rect x="170" y="936" width="900" height="264" class="card bluecard"/>
+  <circle cx="220" cy="976" r="25" fill="#2563eb"/><text x="220" y="984" class="num">6</text>
+  <text x="265" y="975" class="head">Répéter la lecture et l’envoi des morceaux</text>
+  <text x="215" y="1020" class="body">6a. Le plugin Android ouvre l’URI et lit la plage demandée (offset + longueur).</text>
+  <text x="215" y="1054" class="body">6b. JavaScript envoie ce morceau par PATCH /api/uploads/:id avec Upload-Offset.</text>
+  <text x="215" y="1088" class="body">6c. Le serveur ajoute les octets au fichier temporaire et met à jour receivedBytes.</text>
+  <text x="215" y="1122" class="body">6d. Le serveur confirme l’offset; l’application met à jour la progression de cette vidéo.</text>
+  <rect x="215" y="1147" width="810" height="34" rx="9" fill="#dbeafe"/>
+  <text x="620" y="1171" class="small" text-anchor="middle">Retour à 6a jusqu’à ce que receivedBytes = taille totale · morceaux adaptatifs, Android max. 1 Mio</text>
+
+  <!-- Network interruption branch, tied to step 6 -->
+  <path d="M1070 1000 H1120" class="blueline"/>
+  <rect x="1135" y="936" width="320" height="264" class="card orangecard"/>
+  <text x="1160" y="978" class="head">Coupure réseau</text>
+  <text x="1160" y="1018" class="body">1. Garder URI et uploadId</text>
+  <text x="1160" y="1052" class="body">dans IndexedDB.</text>
+  <text x="1160" y="1092" class="body">2. À la reconnexion, faire</text>
+  <text x="1160" y="1120" class="body">GET /api/uploads/:id.</text>
+  <text x="1160" y="1160" class="body">3. Reprendre à l’offset</text>
+  <text x="1160" y="1188" class="body">receivedBytes du serveur.</text>
+  <path d="M1295 1200 V1230 H1095 V930 H1078" class="blueline"/>
+  <text x="1150" y="1250" class="small">Retour à l’étape 6</text>
+
+  <path d="M620 1200 V1232" class="line"/>
+  <rect x="170" y="1242" width="900" height="126" class="card bluecard"/>
+  <circle cx="220" cy="1282" r="25" fill="#2563eb"/><text x="220" y="1290" class="num">7</text>
+  <text x="265" y="1281" class="head">Tous les octets sont confirmés : finaliser</text>
+  <text x="205" y="1319" class="body">Le client re-vérifie la source et appelle POST /api/uploads/:id/complete.</text>
+  <text x="205" y="1345" class="small">Le client ne nettoie pas sa tâche sur la seule confirmation du dernier morceau.</text>
+  <path d="M620 1368 V1396" class="line"/>
+
+  <rect x="170" y="1406" width="900" height="126" class="card purplecard"/>
+  <circle cx="220" cy="1446" r="25" fill="#7047d1"/><text x="220" y="1454" class="num">8</text>
+  <text x="265" y="1445" class="head">Le backend valide et lance le traitement vidéo</text>
+  <text x="205" y="1483" class="body">Express vérifie taille/format, déplace le fichier reçu, puis enregistre l’état processing.</text>
+  <text x="205" y="1509" class="small">FFmpeg produit les qualités vidéo et les playlists HLS.</text>
+  <path d="M620 1532 V1560" class="line"/>
+
+  <rect x="170" y="1570" width="900" height="126" class="card greencard"/>
+  <circle cx="220" cy="1610" r="25" fill="#16a34a"/><text x="220" y="1618" class="num">9</text>
+  <text x="265" y="1609" class="head">Le serveur confirme que la vidéo est prête</text>
+  <text x="205" y="1647" class="body">L’application retire alors cette fiche d’IndexedDB et libère l’autorisation devenue inutile.</text>
+  <text x="205" y="1673" class="small">L’original sur le téléphone n’est jamais supprimé.</text>
+
+  <rect x="1135" y="1320" width="320" height="250" class="card" stroke="#fca5a5" fill="#fff1f2"/>
+  <text x="1160" y="1362" class="head">Source inaccessible</text>
+  <text x="1160" y="1402" class="body">Le plugin détecte fichier absent,</text>
+  <text x="1160" y="1430" class="body">permission perdue ou identité</text>
+  <text x="1160" y="1458" class="body">modifiée : seule cette tâche</text>
+  <text x="1160" y="1486" class="body">s’arrête et affiche la raison.</text>
+  <text x="1160" y="1526" class="small">Les autres envois continuent.</text>
+  <path d="M1070 1148 H1100 V1445 H1120" class="line dash"/>
+</svg>

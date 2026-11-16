@@ -19,7 +19,7 @@ const EXTENSIONS = {
 // Un seul PATCH à la fois par session : évite deux écritures concurrentes dans le même .tmp.
 // Si le téléphone relance un morceau alors que l'ancienne requête (coupée côté réseau mais
 // encore ouverte côté serveur) traîne, la NOUVELLE prend la main : l'ancienne est fermée.
-const inflight = new Map(); // uploadId -> { req, done }
+const inflight = new Map(); // uploadId -> { req, done } : requête PATCH actuellement active.
 const completing = new Set();
 
 const tmpPath = (uploadId) => path.join(sessionsDir, `${uploadId}.tmp`);

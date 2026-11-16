@@ -9,7 +9,7 @@ import { createReels } from './ui/reels.js';
 import { createProfile } from './ui/profile.js';
 import { createUserProfile } from './ui/user-profile.js';
 import { createComments } from './ui/comments.js';
-import { createUploader } from './ui/upload-ui.js';
+import { createQueuedUploader as createUploader } from './ui/queued-upload-ui.js';
 import { h, toast } from './ui/dom.js';
 import { icons } from './ui/icons.js';
 

@@ -1,4 +1,4 @@
-// Client HTTP sans dépendance au navigateur (testable dans Node).
+// Client HTTP sans dépendance directe au navigateur.
 export class ApiError extends Error {
   constructor({ status = 0, code = 'REQUEST_FAILED', message, network = false }) {
     super(message || 'Une erreur est survenue pendant la requête.');
