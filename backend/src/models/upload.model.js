@@ -7,7 +7,6 @@ const COLUMNS = `id, user_id, video_id, mime_type, total_size, received_bytes,
 // alors qu'une session est encore active, on la reprend au lieu d'en créer une autre.
 async function createOrResume({ userId, mimeType, totalSize, fingerprint, caption }) {
   return withTransaction(async (client) => {
-    // Cherche d'abord une session active du même utilisateur et verrouille sa ligne pour reprise.
     const existing = await client.query(
       `SELECT ${COLUMNS} FROM uploads
        WHERE user_id = $1 AND fingerprint = $2 AND status = 'in_progress'
@@ -38,26 +37,84 @@ async function findOwned(uploadId, userId) {
   return rows[0] || null;
 }
 
-// Avance le compteur seulement si personne d'autre ne l'a modifié (contrôle optimiste).
-async function advance(uploadId, userId, fromOffset, toOffset) {
-  // UPDATE conditionnel : aucun offset ne bouge si la session a changé entre-temps.
-  const { rows } = await query(
-    `UPDATE uploads
-     SET received_bytes = $4, updated_at = now()
-     WHERE id = $1 AND user_id = $2 AND status = 'in_progress' AND received_bytes = $3
-     RETURNING received_bytes`,
-    [uploadId, userId, fromOffset, toOffset]
-  );
-  return rows[0] ? Number(rows[0].received_bytes) : null;
+// Insère un morceau et avance l'offset dans une seule transaction. Le verrou de
+// la ligne upload sérialise aussi deux PATCH concurrents provenant de serveurs différents.
+async function appendChunk(uploadId, userId, offset, data) {
+  return withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT id, video_id, total_size, received_bytes, status
+       FROM uploads WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+      [uploadId, userId]
+    );
+    const upload = rows[0];
+    if (!upload) return { kind: 'not_found' };
+    if (upload.status !== 'in_progress') return { kind: 'inactive' };
+
+    const totalSize = Number(upload.total_size);
+    const receivedBytes = Number(upload.received_bytes);
+    if (offset !== receivedBytes) {
+      return { kind: 'offset_conflict', receivedBytes, totalSize };
+    }
+    if (offset + data.length > totalSize) return { kind: 'overflow', receivedBytes, totalSize };
+
+    const sequence = await client.query(
+      `SELECT COALESCE(MAX(chunk_number) + 1, 0)::bigint AS next_chunk_number
+       FROM upload_chunks WHERE upload_id = $1`,
+      [uploadId]
+    );
+    const chunkNumber = Number(sequence.rows[0].next_chunk_number);
+
+    await client.query(
+      `INSERT INTO upload_chunks
+         (upload_id, video_id, chunk_number, byte_offset, chunk_size, data)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [uploadId, upload.video_id, chunkNumber, offset, data.length, data]
+    );
+
+    const updated = await client.query(
+      `UPDATE uploads
+       SET received_bytes = $4, updated_at = now()
+       WHERE id = $1 AND user_id = $2 AND status = 'in_progress' AND received_bytes = $3
+       RETURNING received_bytes`,
+      [uploadId, userId, receivedBytes, receivedBytes + data.length]
+    );
+    if (!updated.rows[0]) {
+      // Throwing rolls back the chunk insert too; the byte offset can never get ahead
+      // of the data that was actually committed.
+      const error = new Error('La session a changé pendant l’envoi du morceau.');
+      error.status = 409;
+      throw error;
+    }
+
+    return {
+      kind: 'stored',
+      chunkNumber,
+      receivedBytes: Number(updated.rows[0].received_bytes),
+      totalSize,
+    };
+  });
 }
 
-// Réaligne la base sur la taille réelle du fichier .tmp (coupure en cours d'écriture).
-async function resetReceived(uploadId, bytes) {
-  await query(
-    `UPDATE uploads SET received_bytes = $2, updated_at = now()
-     WHERE id = $1 AND status = 'in_progress'`,
-    [uploadId, bytes]
+async function getChunkStats(uploadId) {
+  const { rows } = await query(
+    `SELECT COUNT(*)::bigint AS chunk_count,
+            COALESCE(SUM(chunk_size), 0)::bigint AS total_bytes
+     FROM upload_chunks WHERE upload_id = $1`,
+    [uploadId]
   );
+  return {
+    chunkCount: Number(rows[0].chunk_count),
+    totalBytes: Number(rows[0].total_bytes),
+  };
+}
+
+async function getChunk(uploadId, chunkNumber) {
+  const { rows } = await query(
+    `SELECT byte_offset, chunk_size, data
+     FROM upload_chunks WHERE upload_id = $1 AND chunk_number = $2`,
+    [uploadId, chunkNumber]
+  );
+  return rows[0] || null;
 }
 
 async function complete(uploadId, userId, sourceName) {
@@ -65,20 +122,24 @@ async function complete(uploadId, userId, sourceName) {
     const { rows } = await client.query(
       `UPDATE uploads SET status = 'complete', updated_at = now()
        WHERE id = $1 AND user_id = $2 AND status = 'in_progress'
+         AND received_bytes = total_size
        RETURNING video_id`,
       [uploadId, userId]
     );
     if (!rows[0]) return null;
-    // PostgreSQL stocke les métadonnées et l'état ; les octets vidéo restent dans les fichiers.
+
     await client.query(
       `UPDATE videos SET status = 'processing', source_name = $2 WHERE id = $1`,
       [rows[0].video_id, sourceName]
     );
+    // Garder les morceaux jusqu'à ce que le fichier assemblé soit vérifié et renommé.
+    // Leur suppression et le changement d'état sont atomiques dans cette transaction.
+    await client.query('DELETE FROM upload_chunks WHERE upload_id = $1', [uploadId]);
     return Number(rows[0].video_id);
   });
 }
 
-// Annulation : la vidéo "uploading" est supprimée, ce qui supprime aussi la session (CASCADE).
+// La suppression de la vidéo cascade vers uploads puis vers upload_chunks.
 async function abort(uploadId, userId) {
   const { rows } = await query(
     `DELETE FROM videos v USING uploads u
@@ -111,8 +172,9 @@ async function listActiveIds() {
 module.exports = {
   createOrResume,
   findOwned,
-  advance,
-  resetReceived,
+  appendChunk,
+  getChunkStats,
+  getChunk,
   complete,
   abort,
   listAbandoned,

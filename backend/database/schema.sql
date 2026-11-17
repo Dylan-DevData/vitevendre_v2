@@ -41,8 +41,8 @@ CREATE INDEX IF NOT EXISTS idx_videos_user ON videos (user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_processing ON videos (id) WHERE status = 'processing';
 
 -- ---------- Sessions d'envoi (upload reprenable par offset) ----------
--- Le serveur est la seule source de vérité : received_bytes = nombre d'octets
--- déjà écrits (en append) dans uploads/sessions/<id>.tmp.
+-- Les octets des morceaux sont conservés dans upload_chunks. received_bytes est
+-- avancé dans la même transaction que l'insertion du morceau correspondant.
 -- fingerprint = signature chaînée de blocs de contenu + taille totale,
 -- indépendante du nom : les blocs sont lus bornés en mémoire pour reconnaître le fichier.
 CREATE TABLE IF NOT EXISTS uploads (
@@ -64,6 +64,35 @@ CREATE TABLE IF NOT EXISTS uploads (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_uploads_active_fingerprint
   ON uploads (user_id, fingerprint) WHERE status = 'in_progress';
 CREATE INDEX IF NOT EXISTS idx_uploads_activity ON uploads (updated_at) WHERE status = 'in_progress';
+
+-- La clé unique composite permet à chaque morceau de garantir que son video_id
+-- correspond bien à la vidéo de sa session d'upload.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_uploads_id_video_id ON uploads (id, video_id);
+
+-- Un morceau = une ligne BYTEA. Le numéro suit l'ordre d'arrivée; byte_offset
+-- et chunk_size permettent de contrôler qu'il n'y a ni trou ni chevauchement.
+CREATE TABLE IF NOT EXISTS upload_chunks (
+  upload_id     UUID NOT NULL,
+  video_id      BIGINT NOT NULL,
+  chunk_number  BIGINT NOT NULL CHECK (chunk_number >= 0),
+  byte_offset   BIGINT NOT NULL CHECK (byte_offset >= 0),
+  chunk_size    INTEGER NOT NULL CHECK (chunk_size > 0),
+  data          BYTEA NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (upload_id, chunk_number),
+  FOREIGN KEY (upload_id, video_id)
+    REFERENCES uploads (id, video_id) ON DELETE CASCADE,
+  CHECK (octet_length(data) = chunk_size)
+);
+
+-- Les sessions commencées avant cette migration avaient leurs octets sur disque.
+-- Elles repartent de zéro une seule fois; celles ayant déjà des lignes de morceaux
+-- gardent leur offset, même si db:init est relancé.
+UPDATE uploads u
+SET received_bytes = 0
+WHERE u.status = 'in_progress'
+  AND u.received_bytes > 0
+  AND NOT EXISTS (SELECT 1 FROM upload_chunks c WHERE c.upload_id = u.id);
 
 -- ---------- J'aime ----------
 CREATE TABLE IF NOT EXISTS video_likes (

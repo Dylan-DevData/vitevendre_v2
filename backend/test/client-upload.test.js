@@ -51,6 +51,7 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
 
   const { createApi } = await client('api-core.js');
   const { UploadTask } = await client('upload/upload-task.js');
+  const { FINGERPRINT_SCHEME } = await client('upload/source.js');
 
   // Vidéo de ~6 Mo : plusieurs morceaux de 512 Ko à 2 Mo.
   const src = path.join(root, 'in.mp4');
@@ -93,11 +94,12 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
 
   // --- Envoi 1 : le fichier "disparaît" après quelques lectures. ---
   let reads = 0;
+  const readsBeforeUpload = Math.ceil(bytes.length / (512 * 1024)) + 1; // vérification initiale + empreinte
   const vanishing = {
     name: 'ma-video.mp4', type: 'video/mp4', size: bytes.length,
     slice(start, end) {
       reads += 1;
-      if (reads > 4) return { arrayBuffer: async () => { throw Object.assign(new Error('gone'), { name: 'NotFoundError' }); } };
+      if (reads > readsBeforeUpload + 3) return { arrayBuffer: async () => { throw Object.assign(new Error('gone'), { name: 'NotFoundError' }); } };
       return new Blob([bytes]).slice(start, end);
     },
   };
@@ -118,8 +120,21 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   const status = await api.getUpload(firstSession);
   assert.equal(status.status, 'in_progress');
   assert.equal(status.receivedBytes, task1.sent);
-  const tmp = path.join(process.env.UPLOAD_DIR, 'sessions', `${firstSession}.tmp`);
-  assert.equal(fs.statSync(tmp).size, status.receivedBytes);
+  const saved = await pool.query(
+    `SELECT video_id, chunk_number, byte_offset, chunk_size, data
+     FROM upload_chunks WHERE upload_id = $1 ORDER BY chunk_number`,
+    [firstSession]
+  );
+  let savedOffset = 0;
+  saved.rows.forEach((chunk, index) => {
+    assert.equal(Number(chunk.video_id), task1.videoId);
+    assert.equal(Number(chunk.chunk_number), index);
+    assert.equal(Number(chunk.byte_offset), savedOffset);
+    assert.equal(Number(chunk.chunk_size), chunk.data.length);
+    savedOffset += chunk.data.length;
+  });
+  assert.equal(savedOffset, status.receivedBytes);
+  assert.ok(Buffer.concat(saved.rows.map((chunk) => chunk.data)).equals(bytes.subarray(0, status.receivedBytes)));
 
   // --- Envoi 2 : même fichier RENOMMÉ -> même session, reprise sans renvoyer l'existant. ---
   const renamed = new File([bytes], 'autre-nom.mp4', { type: 'video/mp4' });
@@ -132,10 +147,12 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   assert.equal(session2.sent, sentFromServer, 'reprise exactement à l’offset du serveur');
   assert.ok(result.videoId > 0);
   assert.equal(task2.state, 'processing');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [firstSession])).rows[0].n, 0);
 
   // --- Mauvais fichier : l'empreinte détecte que ce n'est pas le même. ---
   const other = new File([crypto.randomBytes(200000)], 'x.mp4', { type: 'video/mp4' });
-  const task3 = new UploadTask({ file: other, api, env, expectedFingerprint: task1.fingerprint });
+  const task3 = new UploadTask({ file: other, api, env,
+    expectedFingerprint: task1.fingerprint, expectedFingerprintScheme: FINGERPRINT_SCHEME });
   await assert.rejects(task3.start(), /pas celui/);
   assert.equal(task3.state, 'mismatch');
 
@@ -143,8 +160,9 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   let video;
   for (let i = 0; i < 120; i += 1) {
     video = (await api.getVideo(result.videoId)).video;
-    if (video.status === 'ready' || video.status === 'failed') break;
+    if (video.status === 'failed' || (video.status === 'ready' && video.renditions.includes('720p'))) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   assert.equal(video.status, 'ready');
+  assert.deepEqual(video.renditions, ['240p', '480p', '720p']);
 });

@@ -6,9 +6,9 @@ Ce document suit une vidéo depuis le sélecteur du téléphone jusqu’au backe
 
 1. Le navigateur garde un objet `File`. Android garde une URI `content://` accordée par le sélecteur système. Aucun des deux ne copie la vidéo entière en mémoire.
 2. Le client lit une tranche à la fois : `file.slice()` sur le web ou le pont natif Android. Elle commence à **512 Kio**, s’adapte au débit, et ne dépasse pas **2 Mio sur le web** ou **1 Mio sur Android**.
-3. Chaque tranche est envoyée en requête HTTP `PATCH`. Le backend la fait passer dans un flux Node.js vers un fichier temporaire `.tmp`.
-4. PostgreSQL enregistre l’offset confirmé. Après une coupure, le client demande cet offset au serveur et reprend à cet endroit.
-5. Quand tous les octets sont reçus, le backend vérifie la taille et le format, déplace le fichier source, met la vidéo en traitement et la place dans la file FFmpeg.
+3. Chaque tranche est envoyée en requête HTTP `PATCH`. Le backend l’enregistre dans `upload_chunks` en PostgreSQL avec son numéro, son offset et les octets.
+4. L’insertion du morceau et la progression sont atomiques. Après une coupure, le client demande `receivedBytes` au serveur et reprend à cet endroit.
+5. Quand tous les octets sont reçus, le backend relit et assemble les morceaux dans l’ordre, vérifie le fichier source, supprime les lignes de morceaux et place la vidéo dans la file FFmpeg.
 6. FFmpeg écrit des playlists HLS et des segments vidéo sur le disque. Le frontend lit ensuite la playlist et les segments à la demande.
 
 **« Sans passer par la RAM » signifie ici « sans mettre le fichier complet en RAM ».** Le navigateur garde une tranche en mémoire pendant sa lecture et son envoi ; Node.js et FFmpeg utilisent également leurs tampons de flux normaux. La mémoire utilisée reste limitée par rapport à la taille totale d’une vidéo.
@@ -85,11 +85,7 @@ Content-Type: application/json
 }
 ```
 
-Le backend valide le type, la taille, l’empreinte et la légende. `upload.model.js` crée une ligne de vidéo avec l’état `uploading` et une ligne de session `uploads` avec un UUID, le total et `received_bytes = 0`. Il crée aussi le fichier temporaire correspondant :
-
-```text
-backend/uploads/sessions/<uuid>.tmp
-```
+Le backend valide le type, la taille, l’empreinte et la légende. `upload.model.js` crée une ligne de vidéo avec l’état `uploading` et une ligne de session `uploads` avec un UUID, le total et `received_bytes = 0`. Les morceaux seront insérés dans `upload_chunks`; aucun fichier temporaire de session n’est créé.
 
 Le dossier exact dépend de `UPLOAD_DIR` dans `backend/.env` et du dossier depuis lequel le backend est lancé. Avec `UPLOAD_DIR=./uploads` et un démarrage depuis `backend`, les chemins ci-dessus sont ceux du projet. Si la même personne renvoie un fichier de même empreinte avec une session encore active, le backend retourne cette session au lieu d’en créer une autre.
 
@@ -114,28 +110,26 @@ Dans `appendChunk()` (`backend/src/controllers/upload.controller.js`), le backen
 1. Vérifie la session et que l’utilisateur est bien son propriétaire.
 2. Vérifie `Upload-Offset`, `Content-Length`, la taille maximale d’une tranche et le total annoncé.
 3. Compare l’offset envoyé par le téléphone à `received_bytes` en base.
-4. Transmet le corps avec `pipeline(req, fs.createWriteStream(...))` au fichier temporaire, en mode append (`flags: 'a'`).
-5. Vérifie que le nombre d’octets réellement reçus est celui annoncé.
-6. Avance `received_bytes` dans PostgreSQL seulement après l’écriture complète.
+4. Lit le corps, borné par `Content-Length` et la taille maximale d’un morceau.
+5. Insère `upload_id`, `video_id`, `chunk_number`, `byte_offset`, `chunk_size` et les octets `BYTEA` dans `upload_chunks`.
+6. Avance `received_bytes` dans la même transaction PostgreSQL que l’insertion du morceau.
 
 ```js
-// Le flux HTTP req est pompé vers le disque ; la vidéo complète n’est pas accumulée en Buffer.
-await pipeline(req, fs.createWriteStream(file, { flags: 'a' }));
-
-// L’offset en base avance uniquement après réception exacte de la tranche.
-const received = await uploadModel.advance(uploadId, userId, dbOffset, dbOffset + length);
+// Le morceau borné est inséré avec son numéro et son offset.
+// Son insertion et l'avancement de received_bytes sont dans la même transaction.
+const result = await uploadModel.appendChunk(uploadId, userId, offset, data);
 ```
 
-`pipeline()` propage les erreurs et applique la contre-pression des flux : si le disque ne suit pas, la lecture du flux réseau ralentit au lieu de remplir une énorme variable en mémoire. Le serveur compte les octets reçus avec un compteur, mais ne les conserve pas tous en mémoire.
+Le backend conserve en mémoire uniquement le morceau courant, borné par `Content-Length` et `UPLOAD_CHUNK_MAX_BYTES`. Les octets confirmés sont conservés dans les lignes PostgreSQL jusqu'à l'assemblage final; la vidéo entière n'est jamais chargée en mémoire.
 
-Le schéma de la session est dans [`backend/database/schema.sql`](../backend/database/schema.sql). La ligne `uploads.received_bytes` est le prochain offset confirmé, et le fichier `.tmp` contient les octets déjà écrits dans l’ordre.
+Le schéma de la session et des morceaux est dans [`backend/database/schema.sql`](../backend/database/schema.sql). `uploads.received_bytes` est le prochain offset confirmé; les lignes `upload_chunks` contiennent les plages déjà reçues.
 
 ## 5. Coupure réseau, doublons et reprise
 
 Le serveur est la source de vérité sur l’avancement : `received_bytes`.
 
 - Si le client annonce un offset différent, le serveur répond **409** avec l’offset réel. Le client se recale.
-- Si une tranche est coupée en plein milieu, le backend tronque le `.tmp` à la dernière position validée en base. Les octets incomplets ne sont pas considérés comme reçus.
+- Si une tranche est coupée en plein milieu, la requête ne complète pas l’insertion transactionnelle. Aucun morceau partiel n’est conservé et `received_bytes` ne bouge pas.
 - Après une erreur réseau, le client attend avec un délai croissant, demande `GET /api/uploads/<uuid>` et reprend depuis `receivedBytes`.
 - Une seule requête `PATCH` par session est active à la fois ; une nouvelle requête remplace l’ancienne si elle est restée bloquée.
 - Pause et annulation sont gérées par `UploadTask`. Une annulation supprime la session incomplète ; une simple coupure conserve la session.
@@ -149,14 +143,14 @@ Les principales fonctions du protocole se trouvent dans `UploadTask.#transfer()`
 
 Quand le client a envoyé toutes les tranches, il appelle `POST /api/uploads/<uuid>/complete`.
 
-Le backend ne concatène pas des morceaux gardés en mémoire : **ils ont déjà été ajoutés dans l’ordre dans le même fichier `.tmp`**. À la fin, `completeUpload()` vérifie :
+Le backend ne charge pas la vidéo entière en mémoire. À la fin, `completeUpload()` relit les lignes `upload_chunks` une par une dans l’ordre et vérifie :
 
 1. Qu’aucune écriture n’est encore en cours.
 2. Que `received_bytes` correspond à `total_size`.
-3. Que la taille du fichier `.tmp` correspond au total.
+3. Que les offsets et la taille assemblée correspondent au total.
 4. Que les premiers octets ressemblent à un conteneur accepté (signature MP4/MOV/3GP `ftyp` ou WebM/Matroska EBML).
 
-Il déplace ensuite le fichier temporaire — opération de renommage sur le même disque, sans reconstruire le fichier en RAM — vers :
+Il assemble ensuite un fichier source temporaire, vérifie son en-tête et le renomme vers :
 
 ```text
 backend/uploads/sources/<videoId>.<extension>
@@ -206,9 +200,9 @@ Dans le navigateur ou WebView Android, `player.js` utilise `hls.js` si disponibl
 | Session, tranches, pause, reprise, retry et fin | `noteApp/www/js/upload/upload-task.js` |
 | Requêtes HTTP `POST`, `GET`, `PATCH`, `complete`, `abort` | `noteApp/www/js/api-core.js` |
 | Déclaration des routes upload | `backend/src/routes/upload.routes.js` |
-| Validation et écriture flux vers `.tmp` | `backend/src/controllers/upload.controller.js` |
-| Sessions, offset et transactions PostgreSQL | `backend/src/models/upload.model.js` |
-| Tables `videos` et `uploads` | `backend/database/schema.sql` |
+| Validation, stockage des morceaux et assemblage | `backend/src/controllers/upload.controller.js` |
+| Sessions, morceaux, offsets et transactions PostgreSQL | `backend/src/models/upload.model.js` |
+| Tables `videos`, `uploads` et `upload_chunks` | `backend/database/schema.sql` |
 | Nettoyage de sessions abandonnées | `backend/src/services/gc.service.js` |
 | File FFmpeg et reprise après redémarrage | `backend/src/services/transcode-queue.service.js` |
 | FFprobe, FFmpeg, qualités HLS et poster | `backend/src/services/ffmpeg.service.js` |
@@ -217,5 +211,5 @@ Dans le navigateur ou WebView Android, `player.js` utilise `hls.js` si disponibl
 
 ## Formulation courte pour l’expliquer à l’oral
 
-> « Le téléphone ne charge pas toute la vidéo en mémoire. Android conserve une URI accordée par le sélecteur système ; le navigateur garde son objet `File`. Le client lit des plages bornées, calcule une signature en parcourant le fichier bloc par bloc, puis envoie chaque tranche en `PATCH`. Le backend écrit les octets directement dans un fichier temporaire et confirme l’offset dans PostgreSQL. En cas de coupure, il reprend à l’offset confirmé. Quand le fichier est complet, le backend le déplace vers les sources et le passe à FFmpeg, qui fabrique les qualités HLS et leurs segments sur le disque. »
+> « Le téléphone ne charge pas toute la vidéo en mémoire. Android conserve une URI accordée par le sélecteur système ; le navigateur garde son objet `File`. Le client lit des plages bornées, calcule une signature par blocs, puis envoie chaque tranche en `PATCH`. PostgreSQL enregistre chaque morceau avec sa session, sa vidéo et son offset dans une transaction. En cas de coupure, le client reprend à `receivedBytes`. Quand tous les morceaux sont reçus, le backend les assemble en fichier source, supprime leurs lignes après vérification et passe la vidéo à FFmpeg pour produire le HLS. »
 

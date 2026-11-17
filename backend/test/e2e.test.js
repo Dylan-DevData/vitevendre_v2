@@ -108,14 +108,29 @@ test('upload reprenable + HLS multi-résolution + GC', { skip, timeout: 240000 }
     assert.equal(r.status, 200);
     offset = r.data.receivedBytes;
   }
+  const storedChunks = await pool.query(
+    `SELECT video_id, chunk_number, byte_offset, chunk_size, data
+     FROM upload_chunks WHERE upload_id = $1 ORDER BY chunk_number`,
+    [uploadId]
+  );
+  let storedOffset = 0;
+  storedChunks.rows.forEach((chunk, index) => {
+    assert.equal(Number(chunk.video_id), created.data.videoId);
+    assert.equal(Number(chunk.chunk_number), index);
+    assert.equal(Number(chunk.byte_offset), storedOffset);
+    assert.equal(Number(chunk.chunk_size), chunk.data.length);
+    storedOffset += chunk.data.length;
+  });
+  assert.equal(storedOffset, bytes.length);
+  assert.ok(Buffer.concat(storedChunks.rows.map((chunk) => chunk.data)).equals(bytes), 'les morceaux en base doivent reconstituer la vidéo');
   const sessionFile = path.join(process.env.UPLOAD_DIR, 'sessions', `${uploadId}.tmp`);
-  assert.equal(fs.statSync(sessionFile).size, bytes.length);
-  assert.ok(fs.readFileSync(sessionFile).equals(bytes), 'le fichier assemblé doit être identique');
+  assert.equal(fs.existsSync(sessionFile), false);
 
   r = await call('POST', `/api/uploads/${uploadId}/complete`, { token });
   assert.equal(r.status, 202);
   const videoId = r.data.videoId;
   assert.equal(fs.existsSync(sessionFile), false);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [uploadId])).rows[0].n, 0);
 
   // 5. Le transcodage publie 240p+480p, puis ajoute 720p+1080p.
   let video;
@@ -150,14 +165,13 @@ test('upload reprenable + HLS multi-résolution + GC', { skip, timeout: 240000 }
   const stale = await call('POST', '/api/uploads', {
     token, json: { mime_type: 'video/mp4', total_size: 5000, fingerprint: 'a'.repeat(64) },
   });
-  const staleFile = path.join(process.env.UPLOAD_DIR, 'sessions', `${stale.data.uploadId}.tmp`);
-  assert.equal(fs.existsSync(staleFile), true);
   await pool.query(`UPDATE uploads SET updated_at = now() - interval '25 hours' WHERE id = $1`, [stale.data.uploadId]);
   const result = await gc.collect();
   assert.equal(result.sessions, 1);
-  assert.equal(fs.existsSync(staleFile), false);
   const left = await pool.query('SELECT count(*)::int AS n FROM uploads WHERE id = $1', [stale.data.uploadId]);
   assert.equal(left.rows[0].n, 0);
+  const staleChunks = await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [stale.data.uploadId]);
+  assert.equal(staleChunks.rows[0].n, 0);
 });
 
 test('l’échelle de qualités ne dépasse jamais la source', () => {

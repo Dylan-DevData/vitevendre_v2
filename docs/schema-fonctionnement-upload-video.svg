@@ -57,7 +57,7 @@
   <text x="265" y="975" class="head">Répéter la lecture et l’envoi des morceaux</text>
   <text x="215" y="1020" class="body">6a. Le plugin Android ouvre l’URI et lit la plage demandée (offset + longueur).</text>
   <text x="215" y="1054" class="body">6b. JavaScript envoie ce morceau par PATCH /api/uploads/:id avec Upload-Offset.</text>
-  <text x="215" y="1088" class="body">6c. Le serveur ajoute les octets au fichier temporaire et met à jour receivedBytes.</text>
+  <text x="215" y="1088" class="body">6c. Le serveur insère le morceau dans upload_chunks et avance receivedBytes.</text>
   <text x="215" y="1122" class="body">6d. Le serveur confirme l’offset; l’application met à jour la progression de cette vidéo.</text>
   <rect x="215" y="1147" width="810" height="34" rx="9" fill="#dbeafe"/>
   <text x="620" y="1171" class="small" text-anchor="middle">Retour à 6a jusqu’à ce que receivedBytes = taille totale · morceaux adaptatifs, Android max. 1 Mio</text>
@@ -86,7 +86,7 @@
   <rect x="170" y="1406" width="900" height="126" class="card purplecard"/>
   <circle cx="220" cy="1446" r="25" fill="#7047d1"/><text x="220" y="1454" class="num">8</text>
   <text x="265" y="1445" class="head">Le backend valide et lance le traitement vidéo</text>
-  <text x="205" y="1483" class="body">Express vérifie taille/format, déplace le fichier reçu, puis enregistre l’état processing.</text>
+  <text x="205" y="1483" class="body">Express assemble les morceaux depuis PostgreSQL, vérifie le fichier, puis lance FFmpeg.</text>
   <text x="205" y="1509" class="small">FFmpeg produit les qualités vidéo et les playlists HLS.</text>
   <path d="M620 1532 V1560" class="line"/>
 

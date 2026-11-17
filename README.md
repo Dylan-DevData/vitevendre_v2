@@ -40,8 +40,8 @@ cordova run android
 - Empreinte = SHA-256 des 64 premiers Ko + 64 derniers Ko + taille exacte. Renommer le fichier ne change rien ; un fichier différent est détecté.
 - Reprise : le serveur est la source de vérité (`receivedBytes`). Après coupure, le client l'interroge et repart à cet octet, sans renvoyer ce qui est validé.
 - Fichier supprimé ou déplacé pendant une pause : la lecture échoue, l'envoi s'arrête proprement et l'utilisateur est prévenu. Il peut resélectionner le fichier pour reprendre.
-- Côté serveur, chaque morceau est écrit en flux à la fin d'un seul fichier `.tmp` (`createWriteStream`, flags `a`). Un morceau interrompu en route est ignoré.
-- Une session sans activité depuis 24 h est supprimée automatiquement (fichier et base).
+- Côté serveur, chaque morceau est stocké dans `upload_chunks` (PostgreSQL) avec son numéro, son offset et son `videoId`. L'insertion et l'avancement de `receivedBytes` sont validés ensemble.
+- À la fin, le backend assemble les morceaux depuis PostgreSQL en un fichier source, puis supprime les lignes de morceaux après vérification. Une session sans activité depuis 24 h et ses morceaux sont supprimés automatiquement.
 
 **Transcodage (serveur)**
 - Une seule commande FFmpeg décode la source une fois et produit HLS 240p, 480p, 720p et 1080p (jamais au-dessus de la source).

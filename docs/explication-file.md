@@ -1,71 +1,51 @@
-# Parcours d’une vidéo : du téléphone au lecteur
+# Parcours d'une vidéo : du téléphone à FFmpeg
 
-Ce pense-bête indique **quel fichier fait quoi**, dans l’ordre. Le frontend lit et envoie une petite tranche à la fois ; le backend écrit chaque tranche dans le même fichier temporaire sur le disque.
+Ce document suit un upload reprenable. Le téléphone envoie une tranche à la fois; PostgreSQL conserve chaque tranche et la position confirmée.
 
 ## A. Frontend : téléphone vers serveur
 
-1. **Choisir le fichier** — `noteApp/www/js/ui/upload-ui.js`  
-   Le sélecteur Android renvoie un objet `File`, qui référence la vidéo sur le téléphone. `URL.createObjectURL(file)` sert à l’aperçu. Cela ne copie pas toute la vidéo en mémoire.
+1. **Choisir la vidéo** — `noteApp/www/js/ui/upload-ui.js` ou `queued-upload-ui.js` ouvre le sélecteur et crée une tâche par vidéo.
+2. **Lire une plage** — `noteApp/www/js/upload/source.js` et `native-video-source.js` lisent seulement la plage demandée du fichier original.
+3. **Calculer l'empreinte** — `noteApp/www/js/upload/source.js` identifie le fichier pour qu'une reprise retrouve la bonne session.
+4. **Créer ou reprendre la session** — `noteApp/www/js/upload/upload-task.js` appelle `POST /api/uploads`; le serveur renvoie `uploadId`, `videoId` et `receivedBytes`.
+5. **Envoyer un morceau** — chaque `PATCH /api/uploads/:id` envoie les octets d'une plage, avec l'offset `Upload-Offset`. Le client attend la confirmation avant de passer à la plage suivante.
 
-2. **Lire une tranche** — `noteApp/www/js/upload/source.js`  
-   `FileSource.read(start, end)` utilise `file.slice(start, end)` pour lire seulement la plage demandée. Le frontend garde temporairement cette tranche en mémoire.
+## B. Backend : réception et stockage PostgreSQL
 
-3. **Choisir la taille** — `noteApp/www/js/upload/chunk-sizer.js`  
-   Commence à **512 Kio**, augmente si le réseau est stable, et ne dépasse pas **2 Mio sur navigateur** ou **1 Mio sur Android**. En cas d’erreur, revient à 512 Kio.
+6. **Diriger la requête** — `backend/src/routes/upload.routes.js` protège les routes et laisse `PATCH` transporter le corps binaire.
+7. **Recevoir et valider le morceau** — `backend/src/controllers/upload.controller.js` vérifie l'offset, la taille déclarée et le nombre d'octets réellement reçus.
+8. **Écrire en base** — `backend/src/models/upload.model.js` insère une ligne `upload_chunks` contenant `upload_id`, `video_id`, `chunk_number`, `byte_offset`, `chunk_size` et `data BYTEA`.
+9. **Confirmer la progression** — l'insertion du morceau et la mise à jour de `uploads.received_bytes` sont dans la même transaction. Si le réseau coupe avant réception complète, PostgreSQL ne valide ni le morceau partiel ni un nouvel offset.
 
-4. **Organiser l’upload et la reprise** — `noteApp/www/js/upload/upload-task.js`  
-   Crée la session, lit une tranche, l’envoie, attend la confirmation du serveur, puis passe à la suivante. En cas de coupure, demande l’offset au serveur et reprend à cette position.
+Chaque vidéo possède sa propre ligne dans `videos`, sa propre session dans `uploads` et ses propres lignes dans `upload_chunks`. Le couple `(upload_id, video_id)` est contrôlé par une clé étrangère.
 
-5. **Envoyer en HTTP** — `noteApp/www/js/api-core.js`  
-   `POST /api/uploads` envoie les métadonnées de la vidéo. Chaque `PATCH /api/uploads/:id` transporte les octets d’une seule tranche et son `Upload-Offset`.
+## C. Coupure réseau et reprise
 
-## B. Backend : serveur vers disque
+10. `upload-task.js` demande `GET /api/uploads/:id` après une interruption.
+11. `receivedBytes` dans PostgreSQL est la position de reprise faisant foi. Le client rouvre la source originale et relit à partir de cet offset.
+12. Une requête répétée pour un ancien offset reçoit **409** et l'offset actuel; elle ne crée pas de doublon.
 
-6. **Brancher l’adresse de l’API** — `backend/src/app.js`  
-   Monte les routes d’upload sous `/api/uploads`.
+## D. Finalisation : PostgreSQL vers FFmpeg
 
-7. **Diriger la requête** — `backend/src/routes/upload.routes.js`  
-   Protège la route avec l’authentification et dirige `PATCH /:id` vers `appendChunk()`. Le corps reste un flux binaire, sans parseur JSON.
+13. **Vérifier la fin** — `completeUpload()` refuse l'assemblage si tous les octets annoncés ne sont pas en base.
+14. **Assembler en flux** — le backend lit les lignes `upload_chunks` dans l'ordre de `chunk_number`, vérifie chaque `byte_offset` et écrit un fichier source temporaire. Il ne charge qu'un morceau à la fois en mémoire.
+15. **Valider le fichier** — le backend vérifie la taille et l'en-tête du conteneur vidéo, puis renomme le fichier complet dans `uploads/sources/`.
+16. **Nettoyer les morceaux** — une transaction met `uploads.status` à `complete`, `videos.status` à `processing`, enregistre `source_name` et supprime les lignes `upload_chunks`. Cette suppression arrive après la création du fichier source.
+17. **Transcoder** — `backend/src/services/transcode-queue.service.js` met le `videoId` en file; `ffmpeg.service.js` lit le fichier source et crée les playlists et segments HLS.
 
-8. **Écrire la tranche** — `backend/src/controllers/upload.controller.js`, fonction `appendChunk()`  
-   Vérifie l’offset, puis relie le flux HTTP au fichier temporaire avec `pipeline(req, fs.createWriteStream(...))`. La tranche est ajoutée à la fin du même fichier `.tmp` ; le serveur ne garde pas la vidéo entière en RAM.
-
-9. **Enregistrer la progression** — `backend/src/models/upload.model.js`  
-   Après l’écriture réussie sur disque, met à jour `received_bytes` dans PostgreSQL. PostgreSQL garde la progression et les métadonnées, pas les octets vidéo.
-
-## C. Fin de l’upload : disque vers FFmpeg
-
-10. **Valider et déplacer le fichier complet** — `backend/src/controllers/upload.controller.js`, fonction `completeUpload()`  
-    Vérifie que tous les octets sont présents. Le `.tmp` contient déjà toutes les tranches dans l’ordre ; il est renommé/déplacé vers `uploads/sources/`. Il n’y a pas de collage des morceaux depuis PostgreSQL.
-
-11. **Mettre en file** — `backend/src/services/transcode-queue.service.js`  
-    Ajoute l’identifiant de la vidéo à la file. FFmpeg recevra le chemin du fichier source complet sur disque, pas les requêtes `PATCH`.
-
-12. **Convertir en HLS** — `backend/src/services/ffmpeg.service.js`  
-    FFmpeg lit le fichier source et écrit les playlists `.m3u8` et segments `.ts` dans `media/videos/<id>/`. La source brute est ensuite supprimée.
-
-## D. Lecture : serveur vers frontend
-
-13. **Servir playlists et segments** — `backend/src/app.js`  
-    Sert les fichiers du dossier `media` quand la vidéo est prête.
-
-14. **Donner l’adresse HLS** — `backend/src/models/video.model.js`  
-    Retourne au client l’URL `hlsUrl` vers `master.m3u8`.
-
-15. **Lire la vidéo** — `noteApp/www/js/player.js`, utilisé par `noteApp/www/js/ui/feed.js` et `noteApp/www/js/ui/reels.js`  
-    hls.js demande la playlist puis les petits segments selon la lecture et le débit réseau.
-
-## À retenir
+## Résumé
 
 ```text
-File sur le téléphone
-  → file.slice() lit une tranche
-  → PATCH HTTP envoie cette tranche
-  → pipeline l’ajoute au fichier .tmp sur le serveur
-  → PostgreSQL mémorise l’offset confirmé
-  → fichier .tmp complet déplacé vers uploads/sources/
-  → file d’attente → FFmpeg → playlists et segments HLS
-  → player.js lit la playlist et les segments
+Vidéo sur le téléphone
+  → lecture d'une plage
+  → PATCH avec Upload-Offset
+  → ligne upload_chunks (upload_id, video_id, chunk_number, byte_offset, data)
+  → transaction : morceau enregistré + received_bytes avancé
+  → coupure : GET renvoie l'offset confirmé, reprise à cette position
+  → fin : lecture ordonnée des morceaux et assemblage en fichier source
+  → vérification et renommage du fichier
+  → suppression des lignes upload_chunks
+  → file de traitement → FFmpeg → HLS
 ```
 
-**La vidéo entière ne passe pas en RAM.** Le frontend utilise temporairement la tranche en cours et le serveur les tampons normaux de ses flux. Les tranches ne sont pas stockées dans PostgreSQL et ne sont pas conservées en fichiers séparés.
+Chaque morceau est temporairement stocké dans PostgreSQL. Les octets sont supprimés après assemblage réussi; la session et la vidéo restent dans la base pour suivre le traitement.

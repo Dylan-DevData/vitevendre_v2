@@ -1,6 +1,7 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const uploadModel = require('../models/upload.model');
 const queue = require('../services/transcode-queue.service');
@@ -16,13 +17,13 @@ const EXTENSIONS = {
   'video/3gpp': '.3gp',
 };
 
-// Un seul PATCH à la fois par session : évite deux écritures concurrentes dans le même .tmp.
-// Si le téléphone relance un morceau alors que l'ancienne requête (coupée côté réseau mais
-// encore ouverte côté serveur) traîne, la NOUVELLE prend la main : l'ancienne est fermée.
-const inflight = new Map(); // uploadId -> { req, done } : requête PATCH actuellement active.
+// Un seul PATCH à la fois par session dans ce processus. La transaction PostgreSQL
+// de appendChunk sérialise également les requêtes si plusieurs processus sont lancés.
+const inflight = new Map();
 const completing = new Set();
 
-const tmpPath = (uploadId) => path.join(sessionsDir, `${uploadId}.tmp`);
+const legacyTmpPath = (uploadId) => path.join(sessionsDir, `${uploadId}.tmp`);
+const assemblyTmpPath = (uploadId) => path.join(sourcesDir, `${uploadId}.assembling.tmp`);
 
 function parseUploadId(value) {
   if (!UUID_PATTERN.test(value)) throw httpError(400, 'Identifiant d’envoi invalide.');
@@ -37,6 +38,39 @@ function present(upload) {
     totalSize: Number(upload.total_size),
     receivedBytes: Number(upload.received_bytes),
   };
+}
+
+function isMissing(error) {
+  return error && error.code === 'ENOENT';
+}
+
+async function removeIfPresent(file) {
+  await fsp.unlink(file).catch((error) => {
+    if (!isMissing(error)) throw error;
+  });
+}
+
+// Lit seulement le morceau courant, borné par Content-Length et la limite API.
+async function readChunkBody(req, expectedLength) {
+  const data = Buffer.allocUnsafe(expectedLength);
+  let received = 0;
+  try {
+    for await (const part of req) {
+      if (received + part.length > expectedLength) {
+        throw httpError(400, 'Le morceau dépasse Content-Length.');
+      }
+      part.copy(data, received);
+      received += part.length;
+    }
+  } catch (error) {
+    if (error.status) throw error;
+    if (error.code === 'ECONNRESET' || req.aborted) throw httpError(400, 'Envoi interrompu.');
+    throw error;
+  }
+  if (received !== expectedLength) {
+    throw httpError(400, `Morceau incomplet : ${expectedLength} octets annoncés, ${received} reçus.`);
+  }
+  return data;
 }
 
 // POST /api/uploads  { mime_type, total_size, fingerprint, caption }
@@ -58,13 +92,9 @@ async function createUpload(req, res, next) {
     }
     if (caption.length > 300) throw httpError(400, 'La légende dépasse 300 caractères.');
 
-    // Crée une session ou retrouve celle du même compte et de la même empreinte interrompue.
     const { upload, resumed } = await uploadModel.createOrResume({
       userId: req.user.id, mimeType, totalSize, fingerprint, caption,
     });
-
-    await fsp.mkdir(sessionsDir, { recursive: true });
-    if (!resumed) await fsp.writeFile(tmpPath(upload.id), '', { flag: 'a' });
 
     return res.status(resumed ? 200 : 201).json({
       ...present(upload),
@@ -76,7 +106,7 @@ async function createUpload(req, res, next) {
   }
 }
 
-// GET /api/uploads/:id  -> où reprendre ? (receivedBytes = prochain offset à envoyer)
+// GET /api/uploads/:id  -> receivedBytes indique le prochain offset à envoyer.
 async function getUpload(req, res, next) {
   try {
     const upload = await uploadModel.findOwned(parseUploadId(req.params.id), req.user.id);
@@ -87,8 +117,8 @@ async function getUpload(req, res, next) {
   }
 }
 
-// PATCH /api/uploads/:id   Upload-Offset: <octets déjà reçus>   body: octets bruts
-// Chaque morceau est écrit en flux (aucun tampon en RAM) à la fin du fichier .tmp.
+// PATCH /api/uploads/:id  Upload-Offset: <octets reçus>  body: octets bruts.
+// Le morceau est validé puis enregistré en BYTEA avec son offset dans une transaction.
 async function appendChunk(req, res, next) {
   const uploadId = parseUploadId(req.params.id);
   const previous = inflight.get(uploadId);
@@ -104,10 +134,9 @@ async function appendChunk(req, res, next) {
     if (!upload || upload.status !== 'in_progress') {
       throw httpError(404, 'Session d’envoi introuvable ou terminée.');
     }
-    // PostgreSQL garde le dernier offset confirmé ; toute tranche doit commencer à cet endroit.
+
     const total = Number(upload.total_size);
     const dbOffset = Number(upload.received_bytes);
-
     const offset = Number(req.get('upload-offset'));
     const length = Number(req.get('content-length'));
     if (!Number.isSafeInteger(offset) || offset < 0) throw httpError(400, 'En-tête Upload-Offset invalide.');
@@ -115,44 +144,24 @@ async function appendChunk(req, res, next) {
       throw httpError(400, `Content-Length doit être compris entre 1 et ${uploadChunkMaxBytes} octets.`);
     }
     if (offset + length > total) throw httpError(400, 'Ce morceau dépasse la taille annoncée.');
-
-    // Désynchronisation (morceau déjà reçu, ou client en retard) : on renvoie l'offset réel.
     if (offset !== dbOffset) return offsetConflict(res, dbOffset);
 
-    // Le .tmp peut contenir des octets d'un morceau précédent interrompu : on le ramène
-    // exactement à l'offset validé avant d'ajouter la suite.
-    const file = tmpPath(uploadId);
-    const stat = await fsp.stat(file).catch((error) => {
-      if (error.code === 'ENOENT') return null;
-      throw error;
+    const data = await readChunkBody(req, length);
+    const result = await uploadModel.appendChunk(uploadId, req.user.id, offset, data);
+    if (result.kind === 'not_found' || result.kind === 'inactive') {
+      throw httpError(404, 'Session d’envoi introuvable ou terminée.');
+    }
+    if (result.kind === 'offset_conflict') return offsetConflict(res, result.receivedBytes);
+    if (result.kind === 'overflow') throw httpError(400, 'Ce morceau dépasse la taille annoncée.');
+
+    res.set('Upload-Offset', String(result.receivedBytes));
+    return res.json({
+      uploadId,
+      videoId: Number(upload.video_id),
+      chunkNumber: result.chunkNumber,
+      receivedBytes: result.receivedBytes,
+      totalSize: result.totalSize,
     });
-    if (!stat || stat.size < dbOffset) {
-      const actual = stat ? stat.size : 0;
-      await fsp.writeFile(file, '', { flag: 'a' });
-      await uploadModel.resetReceived(uploadId, actual);
-      return offsetConflict(res, actual);
-    }
-    if (stat.size > dbOffset) await fsp.truncate(file, dbOffset);
-
-    let written = 0;
-    req.on('data', (data) => { written += data.length; });
-    try {
-      // pipeline relie le flux réseau au disque avec contre-pression, sans Buffer de taille vidéo.
-      await pipeline(req, fs.createWriteStream(file, { flags: 'a' }));
-    } catch (error) {
-      await fsp.truncate(file, dbOffset).catch(() => {});
-      throw error.code === 'ECONNRESET' || req.aborted ? httpError(400, 'Envoi interrompu.') : error;
-    }
-    if (written !== length) {
-      await fsp.truncate(file, dbOffset).catch(() => {});
-      throw httpError(400, `Morceau incomplet : ${length} octets annoncés, ${written} reçus.`);
-    }
-
-    // La base n'avance qu'après confirmation que tous les octets de la tranche sont sur disque.
-    const received = await uploadModel.advance(uploadId, req.user.id, dbOffset, dbOffset + length);
-    if (received === null) throw httpError(409, 'La session a changé pendant l’envoi. Réinterrogez-la.');
-    res.set('Upload-Offset', String(received));
-    return res.json({ uploadId, receivedBytes: received, totalSize: total });
   } catch (error) {
     return next(error);
   } finally {
@@ -169,7 +178,7 @@ function offsetConflict(res, receivedBytes) {
   });
 }
 
-// Vérifie les premiers octets : conteneur MP4/MOV/3GP ("ftyp") ou WebM/Matroska (EBML).
+// Vérifie les premiers octets : conteneur MP4/MOV/3GP (ftyp) ou WebM/Matroska (EBML).
 async function looksLikeVideo(file) {
   const handle = await fsp.open(file, 'r');
   try {
@@ -183,6 +192,42 @@ async function looksLikeVideo(file) {
   }
 }
 
+async function* orderedChunkData(uploadId, chunkCount, totalSize) {
+  let expectedOffset = 0;
+  for (let chunkNumber = 0; chunkNumber < chunkCount; chunkNumber += 1) {
+    const chunk = await uploadModel.getChunk(uploadId, chunkNumber);
+    if (!chunk) throw httpError(409, `Le morceau ${chunkNumber} manque dans PostgreSQL.`);
+
+    const data = Buffer.isBuffer(chunk.data) ? chunk.data : Buffer.from(chunk.data);
+    const byteOffset = Number(chunk.byte_offset);
+    const chunkSize = Number(chunk.chunk_size);
+    if (byteOffset !== expectedOffset || chunkSize !== data.length || data.length < 1) {
+      throw httpError(409, `Le morceau ${chunkNumber} ne suit pas l’ordre attendu.`);
+    }
+    expectedOffset += data.length;
+    if (expectedOffset > totalSize) throw httpError(409, 'Les morceaux dépassent la taille annoncée.');
+    yield data;
+  }
+  if (expectedOffset !== totalSize) throw httpError(409, 'Les morceaux ne forment pas la taille annoncée.');
+}
+
+// Assemble en flux depuis PostgreSQL : un seul morceau à la fois est chargé en mémoire.
+async function assembleUpload(uploadId, totalSize, destination) {
+  const stats = await uploadModel.getChunkStats(uploadId);
+  if (!stats.chunkCount || stats.totalBytes !== totalSize) {
+    throw httpError(409, 'Les morceaux enregistrés ne correspondent pas à la taille de la vidéo.');
+  }
+
+  await removeIfPresent(destination);
+  await pipeline(
+    Readable.from(orderedChunkData(uploadId, stats.chunkCount, totalSize)),
+    fs.createWriteStream(destination, { flags: 'wx' })
+  );
+
+  const stat = await fsp.stat(destination);
+  if (stat.size !== totalSize) throw httpError(409, 'Le fichier assemblé est incomplet.');
+}
+
 // POST /api/uploads/:id/complete
 async function completeUpload(req, res, next) {
   const uploadId = parseUploadId(req.params.id);
@@ -190,6 +235,7 @@ async function completeUpload(req, res, next) {
     return next(httpError(409, 'Un envoi est encore en cours.'));
   }
   completing.add(uploadId);
+  const assemblingFile = assemblyTmpPath(uploadId);
   try {
     const upload = await uploadModel.findOwned(uploadId, req.user.id);
     if (!upload) throw httpError(404, 'Session d’envoi introuvable.');
@@ -207,36 +253,49 @@ async function completeUpload(req, res, next) {
       });
     }
 
-    // Compare la taille du fichier temporaire à la taille annoncée et à l'offset enregistré.
-    const file = tmpPath(uploadId);
-    const stat = await fsp.stat(file).catch(() => null);
-    if (!stat || stat.size !== total) {
-      const actual = stat ? stat.size : 0;
-      await uploadModel.resetReceived(uploadId, actual);
-      throw httpError(409, 'Le fichier reçu est incomplet : reprenez l’envoi.');
+    await fsp.mkdir(sourcesDir, { recursive: true });
+    try {
+      await assembleUpload(uploadId, total, assemblingFile);
+    } catch (error) {
+      await removeIfPresent(assemblingFile).catch(() => {});
+      throw error;
     }
-    if (!(await looksLikeVideo(file))) {
+
+    if (!(await looksLikeVideo(assemblingFile))) {
       await uploadModel.abort(uploadId, req.user.id);
-      await fsp.unlink(file).catch(() => {});
+      await removeIfPresent(assemblingFile).catch(() => {});
+      await removeIfPresent(legacyTmpPath(uploadId)).catch(() => {});
       throw httpError(422, 'Le fichier reçu n’est pas une vidéo reconnue.');
     }
 
     const sourceName = `${upload.video_id}${EXTENSIONS[upload.mime_type]}`;
-    await fsp.mkdir(sourcesDir, { recursive: true });
-    // Les morceaux sont déjà réunis dans ce fichier : rename le déplace sans recharger son contenu.
-    await fsp.rename(file, path.join(sourcesDir, sourceName));
+    const sourcePath = path.join(sourcesDir, sourceName);
+    // Une tentative précédente peut avoir assemblé le fichier puis s'être arrêtée
+    // avant la transaction finale. Les morceaux sont encore en base : on peut refaire.
+    await removeIfPresent(sourcePath);
+    await fsp.rename(assemblingFile, sourcePath);
 
     const videoId = await uploadModel.complete(uploadId, req.user.id, sourceName);
-    if (!videoId) throw httpError(404, 'Session d’envoi introuvable.');
-    // Le traitement est asynchrone : 202 signifie « reçu, conversion en cours ».
-    queue.enqueue(videoId);
+    if (!videoId) {
+      const current = await uploadModel.findOwned(uploadId, req.user.id);
+      if (!current || current.status !== 'complete') {
+        throw httpError(409, 'La session a changé pendant l’assemblage. Réessayez.');
+      }
+    }
+
+    await removeIfPresent(legacyTmpPath(uploadId)).catch((error) => {
+      logger.error('legacy_upload_tmp_cleanup_failed', { uploadId, message: error.message });
+    });
+    const completedVideoId = videoId || Number(upload.video_id);
+    queue.enqueue(completedVideoId);
     return res.status(202).json({
       uploadId,
-      videoId,
+      videoId: completedVideoId,
       status: 'processing',
-      message: 'Vidéo reçue : transcodage HLS en cours.',
+      message: 'Vidéo assemblée depuis PostgreSQL : transcodage HLS en cours.',
     });
   } catch (error) {
+    await removeIfPresent(assemblingFile).catch(() => {});
     return next(error);
   } finally {
     completing.delete(uploadId);
@@ -249,8 +308,11 @@ async function abortUpload(req, res, next) {
     const uploadId = parseUploadId(req.params.id);
     const removed = await uploadModel.abort(uploadId, req.user.id);
     if (!removed) throw httpError(404, 'Session d’envoi introuvable.');
-    await fsp.unlink(tmpPath(uploadId)).catch((error) => {
-      if (error.code !== 'ENOENT') logger.error('upload_tmp_cleanup_failed', { uploadId, message: error.message });
+    await removeIfPresent(legacyTmpPath(uploadId)).catch((error) => {
+      logger.error('upload_tmp_cleanup_failed', { uploadId, message: error.message });
+    });
+    await removeIfPresent(assemblyTmpPath(uploadId)).catch((error) => {
+      logger.error('upload_assembly_tmp_cleanup_failed', { uploadId, message: error.message });
     });
     return res.status(204).end();
   } catch (error) {

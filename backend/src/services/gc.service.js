@@ -6,8 +6,8 @@ const logger = require('../utils/logger');
 
 // Nettoyage périodique des envois abandonnés.
 //  1. Supprime les sessions « in_progress » sans activité depuis plus longtemps que le TTL
-//     (24 heures par défaut), ainsi que leur fichier temporaire et leur ligne en base.
-//  2. Supprime les fichiers .tmp orphelins sans session active lorsqu'ils dépassent le TTL.
+//     (24 heures par défaut); PostgreSQL cascade la suppression à leurs morceaux.
+//  2. Supprime les anciens fichiers .tmp orphelins laissés par les versions précédentes.
 async function collect() {
   let sessions = 0;
   let orphans = 0;

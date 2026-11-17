@@ -38,7 +38,7 @@ module.exports = {
   jwtSecret: process.env.JWT_SECRET,
   corsOrigin: process.env.CORS_ORIGIN || '*',
   uploadDir,
-  sessionsDir: path.join(uploadDir, 'sessions'), // <upload_id>.tmp (écriture append-only)
+  sessionsDir: path.join(uploadDir, 'sessions'), // nettoyage des anciens fichiers .tmp
   sourcesDir: path.join(uploadDir, 'sources'),   // vidéo complète en attente de transcodage
   mediaDir: process.env.MEDIA_DIR || path.join(__dirname, '..', '..', 'media'),
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',

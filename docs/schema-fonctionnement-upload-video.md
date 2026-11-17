@@ -1,42 +1,27 @@
-# Fonctionnement de l’upload vidéo ViteVendre
+# Fonctionnement de l'upload vidéo ViteVendre
 
-Ce schéma décrit le trajet d’une vidéo depuis sa sélection sur Android jusqu’à sa publication, ainsi que la reprise d’un transfert interrompu.
+Ce schéma décrit le trajet d'une vidéo depuis sa sélection sur Android jusqu'à sa publication, ainsi que la reprise d'un transfert interrompu.
 
-## Schéma de fonctionnement
+![Schéma graphique du fonctionnement complet de l'upload vidéo](./schema-fonctionnement-upload-video.svg)
 
-![Schéma graphique du fonctionnement complet de l’upload vidéo](./schema-fonctionnement-upload-video.svg)
+## Parcours
 
-Le diagramme ci-dessus est une image SVG intégrée au document; elle reste visible même si l’aperçu Markdown ne sait pas afficher Mermaid.
+1. **Sélection** — Android peut renvoyer plusieurs URI `content://`. Le plugin récupère le nom, le type et la taille de chaque vidéo.
+2. **Association locale** — La file crée une tâche par vidéo. IndexedDB garde l'URI, l'état et l'`uploadId` de cette tâche; il ne stocke pas les octets vidéo.
+3. **Session serveur** — `POST /api/uploads` crée ou reprend une ligne `uploads`, liée à un `videoId` distinct.
+4. **Transfert par morceaux** — Le client envoie chaque plage avec `PATCH /api/uploads/:id` et `Upload-Offset`. Le backend insère une ligne `upload_chunks` (`upload_id`, `video_id`, `chunk_number`, `byte_offset`, `chunk_size`, `data BYTEA`) et avance `received_bytes` dans la même transaction.
+5. **Plusieurs vidéos** — Chaque vidéo a son `videoId`, son `uploadId` et ses lignes de morceaux. Le nombre de tâches envoyées simultanément est réglable et vaut deux par défaut.
+6. **Coupure et reprise** — Après reconnexion ou redémarrage, l'application demande au serveur l'état de son `uploadId`. `receivedBytes` vient de PostgreSQL; le client relit la source à cette position.
+7. **Finalisation** — Le backend lit les morceaux un par un dans l'ordre, contrôle leurs offsets et assemble le fichier source. Après vérification et renommage du fichier, il marque l'upload complet et supprime ses lignes `upload_chunks`.
+8. **Transcodage** — Le serveur transmet le fichier source à FFmpeg, qui produit le streaming HLS.
 
-Le SVG ci-dessus suit les étapes dans l’ordre. Orange : reprise après coupure réseau. Rouge : arrêt de la seule tâche concernée.
+## Identifiants
 
-## Lecture du schéma
+| Valeur | Rôle |
+|---|---|
+| `videos.id` (`videoId`) | Identifie la vidéo publiée et son transcodage. |
+| `uploads.id` (`uploadId`) | Identifie la session reprenable d'une vidéo. |
+| `upload_chunks.chunk_number` | Identifie l'ordre d'un morceau dans cette session. |
+| `upload_chunks.byte_offset` | Vérifie que les morceaux sont contigus, sans trou ni chevauchement. |
 
-1. **Sélection** — Android peut renvoyer plusieurs URI `content://`. Le plugin demande l’autorisation de lecture et récupère le nom, le type, la taille et les métadonnées disponibles.
-2. **Association locale** — La file crée une tâche avec un identifiant unique pour chaque vidéo. IndexedDB enregistre cette tâche, son URI, son état et, dès qu’elle existe, son `uploadId`. Elle ne reçoit jamais les octets vidéo.
-3. **Accès au contenu** — JavaScript transmet l’URI au plugin Cordova. Android résout l’URI avec `ContentResolver` et lit la plage demandée depuis le fichier original.
-4. **Empreinte** — Le plugin Android calcule l’empreinte de contenu par blocs de 512 Kio, avec un tampon borné. Cette vérification ne charge pas la vidéo entière en mémoire.
-5. **Session serveur** — Le client envoie les métadonnées nécessaires avec `POST /api/uploads`. Le backend renvoie un `uploadId` propre à cette vidéo; l’application le sauvegarde dans sa tâche IndexedDB.
-6. **Transfert par morceaux** — Pour chaque morceau, le client lit une plage de la source et l’envoie avec `PATCH /api/uploads/:id` et l’en-tête `Upload-Offset`. Le backend ajoute les octets au fichier temporaire de cette session et met à jour `receivedBytes` dans PostgreSQL.
-7. **Plusieurs envois** — Chaque vidéo a sa propre tâche, sa propre URI et sa propre session. La file démarre au maximum deux tâches à la fois par défaut; la limite est réglable.
-8. **Coupure et reprise** — Après reconnexion ou redémarrage, l’application retrouve chaque tâche grâce à son identifiant, rouvre son URI avec le plugin, puis demande au serveur l’état de son `uploadId`. `receivedBytes` donné par le serveur est la position de reprise faisant foi. Les octets déjà confirmés ne sont pas renvoyés.
-9. **Finalisation** — Quand tous les octets sont reçus, le client appelle `POST /api/uploads/:id/complete`. Le backend vérifie le fichier temporaire, le déplace dans son stockage source, met la vidéo en traitement, puis lance FFmpeg pour produire le streaming HLS.
-10. **Nettoyage local** — Le client retire la tâche temporaire d’IndexedDB seulement après la confirmation finale que la vidéo est prête. Le fichier original du téléphone n’est pas supprimé.
-
-## Comment IndexedDB relie une URI à la bonne vidéo
-
-Chaque tâche possède une clé `id` unique et conserve sa propre URI ainsi que son `uploadSessionId` :
-
-| Clé de tâche | URI Android | Session serveur |
-|---|---|---|
-| `tache-A` | `content://…/video/125` | `session-A` |
-| `tache-B` | `content://…/video/348` | `session-B` |
-
-L’URI sert au plugin Android pour rouvrir le fichier. L’`uploadSessionId` sert à interroger le serveur pour cette même vidéo. `uploadedBytes` est une valeur locale indicative; le serveur reste la source de vérité pour la reprise.
-
-## Limites à expliquer à l’oral
-
-- `content://…` est une référence comprise par Android, pas un chemin physique que JavaScript peut ouvrir directement.
-- Une autorisation persistante dépend du fournisseur Android. Si elle n’est pas conservée ou si l’URI ne fonctionne plus après redémarrage, l’application doit demander une nouvelle sélection.
-- IndexedDB conserve les informations de reprise, mais ne garde pas JavaScript actif en arrière-plan. Si Android ferme l’application, le transfert s’arrête jusqu’à sa réouverture.
-- Le backend suit un offset cumulatif (`receivedBytes`) car les morceaux sont envoyés dans l’ordre; il ne dépend pas d’une liste locale de morceaux supposés reçus.
+La base garantit le lien session/vidéo avec une clé étrangère composite. Les morceaux ne sont supprimés qu'après l'assemblage vérifié du fichier source; une session abandonnée est nettoyée après 24 heures.

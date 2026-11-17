@@ -43,9 +43,9 @@ IndexedDB ne stocke jamais les octets de la vidéo, un Blob ou l’objet File. L
 | Fichier | Responsabilité |
 |---|---|
 | [`backend/src/routes/upload.routes.js`](backend/src/routes/upload.routes.js) | Déclare les cinq opérations HTTP et applique l’authentification. |
-| [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) | Reçoit les demandes, écrit les morceaux, vérifie l’offset et finalise ou annule les sessions. |
-| [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) | Enregistre les sessions, leur état et le nombre d’octets confirmés dans PostgreSQL. |
-| [`backend/src/services/gc.service.js`](backend/src/services/gc.service.js) | Nettoie les sessions abandonnées et les fichiers temporaires orphelins après le TTL. |
+| [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) | Reçoit les demandes, stocke les morceaux, vérifie l’offset et les assemble à la finalisation. |
+| [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) | Enregistre les sessions, les lignes `upload_chunks` et le nombre d’octets confirmés dans PostgreSQL. |
+| [`backend/src/services/gc.service.js`](backend/src/services/gc.service.js) | Nettoie les sessions abandonnées; PostgreSQL supprime leurs morceaux par cascade après le TTL. |
 | [`backend/src/services/transcode-queue.service.js`](backend/src/services/transcode-queue.service.js) | Place les vidéos finalisées dans la file de traitement et récupère les traitements après redémarrage. |
 | [`backend/src/services/ffmpeg.service.js`](backend/src/services/ffmpeg.service.js) | Transcode la source en qualités vidéo et prépare les playlists HLS. |
 | [`backend/src/services/events.service.js`](backend/src/services/events.service.js) | Diffuse les événements de publication au client. |
@@ -93,11 +93,11 @@ Une fiche comprend notamment `id`, `uri`, `name`, `mimeType`, `size`, `lastModif
 ### 6. Le serveur enregistre chaque morceau et confirme sa position
 
 - [`backend/src/routes/upload.routes.js`](backend/src/routes/upload.routes.js) déclare les routes de création, état, morceaux, finalisation et annulation.
-- [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) traite les requêtes. Pour chaque `PATCH`, il écrit les octets reçus dans le fichier temporaire de cette session.
-- [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) enregistre l’état de la session et `received_bytes` dans PostgreSQL.
+- [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) traite les requêtes, écrit chaque morceau dans PostgreSQL et assemble les morceaux à la finalisation.
+- [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) enregistre les lignes `upload_chunks`, l’état de la session et `received_bytes` dans PostgreSQL.
 - Le client met à jour la progression individuelle après la confirmation du serveur.
 
-Les morceaux sont transmis dans l’ordre. Le serveur suit donc un offset cumulatif `receivedBytes` plutôt qu’une liste de numéros de morceaux.
+Les morceaux sont transmis dans l’ordre. PostgreSQL conserve `chunk_number` et `byte_offset` pour chaque ligne; `receivedBytes` reste la position confirmée utilisée pour la reprise.
 
 ### 7. Une coupure déclenche une reprise depuis la source de vérité serveur
 
@@ -111,7 +111,7 @@ Le service [`noteApp/www/js/services/network.js`](noteApp/www/js/services/networ
 ### 8. Le backend finalise, puis traite la vidéo
 
 - `upload-task.js` envoie `POST /api/uploads/:id/complete` quand tous les octets sont confirmés et que la vérification finale de la source réussit.
-- `upload.controller.js` vérifie la taille et le format du fichier temporaire, le déplace vers le stockage source du serveur et met l’enregistrement en traitement.
+- `upload.controller.js` relit les morceaux PostgreSQL dans l’ordre, vérifie les offsets et la taille, écrit le fichier source, puis supprime les morceaux après finalisation.
 - [`backend/src/services/transcode-queue.service.js`](backend/src/services/transcode-queue.service.js) lance le traitement asynchrone.
 - [`backend/src/services/ffmpeg.service.js`](backend/src/services/ffmpeg.service.js) produit les qualités et playlists HLS.
 - [`backend/src/services/events.service.js`](backend/src/services/events.service.js) notifie le client quand la vidéo est prête.
