@@ -40,9 +40,9 @@
 
   <rect x="170" y="608" width="900" height="126" class="card greencard"/>
   <circle cx="220" cy="648" r="25" fill="#16a34a"/><text x="220" y="656" class="num">4</text>
-  <text x="265" y="647" class="head">Android calcule l’empreinte du fichier</text>
-  <text x="205" y="685" class="body">Le plugin lit des blocs de 512 Kio et vérifie l’identité de la source.</text>
-  <text x="205" y="711" class="small">Un tampon borné est utilisé; la vidéo complète n’est pas chargée en mémoire.</text>
+  <text x="265" y="647" class="head">Le client prépare une clé de reprise rapide</text>
+  <text x="205" y="685" class="body">La clé de tâche est enregistrée avec l’URI dans IndexedDB.</text>
+  <text x="205" y="711" class="small">Pas de hachage complet avant le premier morceau envoyé.</text>
   <path d="M620 734 V762" class="line"/>
 
   <rect x="170" y="772" width="900" height="126" class="card purplecard"/>
@@ -60,7 +60,7 @@
   <text x="215" y="1088" class="body">6c. Le serveur insère le morceau dans upload_chunks et avance receivedBytes.</text>
   <text x="215" y="1122" class="body">6d. Le serveur confirme l’offset; l’application met à jour la progression de cette vidéo.</text>
   <rect x="215" y="1147" width="810" height="34" rx="9" fill="#dbeafe"/>
-  <text x="620" y="1171" class="small" text-anchor="middle">Retour à 6a jusqu’à ce que receivedBytes = taille totale · morceaux adaptatifs, Android max. 1 Mio</text>
+  <text x="620" y="1171" class="small" text-anchor="middle">Retour à 6a jusqu’à ce que receivedBytes = taille totale · morceaux adaptatifs 512 Kio–4 Mio</text>
 
   <!-- Network interruption branch, tied to step 6 -->
   <path d="M1070 1000 H1120" class="blueline"/>
@@ -86,8 +86,8 @@
   <rect x="170" y="1406" width="900" height="126" class="card purplecard"/>
   <circle cx="220" cy="1446" r="25" fill="#7047d1"/><text x="220" y="1454" class="num">8</text>
   <text x="265" y="1445" class="head">Le backend valide et lance le traitement vidéo</text>
-  <text x="205" y="1483" class="body">Express assemble les morceaux depuis PostgreSQL, vérifie le fichier, puis lance FFmpeg.</text>
-  <text x="205" y="1509" class="small">FFmpeg produit les qualités vidéo et les playlists HLS.</text>
+  <text x="205" y="1483" class="body">Express fournit les .part ordonnés à FFmpeg, qui produit le MP4 final.</text>
+  <text x="205" y="1509" class="small">Le MP4 validé est ensuite transcodé en qualités et playlists HLS.</text>
   <path d="M620 1532 V1560" class="line"/>
 
   <rect x="170" y="1570" width="900" height="126" class="card greencard"/>

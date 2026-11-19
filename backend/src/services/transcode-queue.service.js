@@ -37,7 +37,9 @@ function pump() {
 async function processOne(videoId) {
   const video = await videoModel.getForProcessing(videoId);
   if (!video || !video.source_name || path.basename(video.source_name) !== video.source_name) return;
-  // La file ne garde que des identifiants ; FFmpeg lira la source depuis le disque.
+  // L'upload.controller a déjà demandé à FFmpeg d'assembler les .part en MP4 et
+  // a conservé ce nom de source en base. La file garde seulement l'id vidéo; elle
+  // transmet le MP4 final à la passe FFmpeg HLS, puis supprime la source.
   const sourcePath = path.join(sourcesDir, video.source_name);
   try {
     // La première passe publie dès que les qualités de base sont prêtes.

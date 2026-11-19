@@ -1,11 +1,30 @@
 const fs = require('fs/promises');
+const nodeFs = require('fs');
 const path = require('path');
 const { spawn, execFile } = require('child_process');
 const { promisify } = require('util');
+const { pipeline } = require('stream/promises');
 const { ffmpegPath, ffprobePath, mediaDir, maxVideoBytes } = require('../config/env');
 const logger = require('../utils/logger');
 
 const execFileAsync = promisify(execFile);
+
+// Protocoles annoncés par ce FFmpeg, mis en cache pour la durée du processus.
+// L'assemblage utilise concatf (FFmpeg >= 8) puis replie sur concat (universel)
+// puis sur une concaténation Node : aucun déploiement ne doit rester bloqué.
+let protocolsPromise = null;
+async function supportedProtocols() {
+  if (!protocolsPromise) {
+    protocolsPromise = execFileAsync(ffmpegPath, ['-hide_banner', '-protocols'])
+      .then(({ stdout }) => new Set(String(stdout).toLowerCase().split(/\s+/).filter(Boolean)))
+      .catch((error) => {
+        protocolsPromise = null;
+        error.status = 503;
+        throw error;
+      });
+  }
+  return protocolsPromise;
+}
 
 // Échelle de qualités. "short" = petit côté de l'image (la largeur pour une vidéo
 // verticale 9:16) : une vidéo TikTok "480p" fait donc 480x854, pas 270x480.
@@ -121,9 +140,9 @@ function buildHlsArgs(input, outDir, rungs, info) {
   return { args, sizes };
 }
 
-function run(args) {
+function run(args, { cwd } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(ffmpegPath, args, { cwd, stdio: ['ignore', 'ignore', 'pipe'] });
     let tail = '';
     child.stderr.on('data', (data) => { tail = (tail + data.toString()).slice(-2000); });
     child.on('error', reject);
@@ -134,6 +153,60 @@ function run(args) {
       return reject(error);
     });
   });
+}
+
+// Première étape FFmpeg : assemble les plages .part d'un upload en un seul MP4.
+// `inputPath` vaut `concatf:<manifeste>`; c'est FFmpeg qui ouvre chaque chemin du manifeste
+// et lit les fichiers dans l'ordre comme un flux d'octets continu. Node ne recopie/concatène
+// pas les morceaux. Le concat demuxer n'est pas utilisé, car les .part ne sont pas des vidéos
+// autonomes : chacun est une plage arbitraire du même fichier original.
+// FFmpeg copie les codecs si MP4 les accepte, sinon il réencode, puis FFprobe valide le MP4.
+async function assembleMp4(inputPath, outputPath, runOptions = {}) {
+  await assertAvailable();
+  await fs.rm(outputPath, { force: true });
+
+  const base = ['-hide_banner', '-nostdin', '-y', '-i', inputPath,
+    '-map', '0:v:0', '-map', '0:a?', '-sn', '-dn'];
+  try {
+    await run([...base, '-c', 'copy', '-movflags', '+faststart', outputPath], runOptions);
+  } catch (copyError) {
+    await fs.rm(outputPath, { force: true });
+    try {
+      await run([...base, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath], runOptions);
+    } catch (encodeError) {
+      await fs.rm(outputPath, { force: true });
+      const error = new Error('FFmpeg ne peut pas assembler ce fichier en MP4.');
+      const details = `${copyError.details || ''}\n${encodeError.details || ''}`;
+      const concatfMissing = inputPath.startsWith('concatf:')
+        && /protocol[^\n]*(not found|unknown|not on whitelist)|unknown protocol/i.test(details);
+      error.status = concatfMissing ? 503 : 422;
+      if (concatfMissing) error.code = 'FFMPEG_CONCATF_UNAVAILABLE';
+      error.cause = encodeError;
+      error.details = details.trim();
+      throw error;
+    }
+  }
+
+  try {
+    await probe(outputPath);
+  } catch (cause) {
+    await fs.rm(outputPath, { force: true });
+    const error = new Error('FFmpeg a produit un MP4 illisible.');
+    error.status = 422;
+    error.cause = cause;
+    throw error;
+  }
+}
+
+// Dernier repli (aucun protocole concat disponible) : recopie séquentielle des .part
+// en un fichier unique avec des streams Node. Un seul .part est lu à la fois, jamais
+// chargé intégralement en Buffer. `inputPath` pointe ensuite vers ce fichier complet.
+async function concatPartsToFile(partPaths, outputPath) {
+  await fs.rm(outputPath, { force: true });
+  for (const partPath of partPaths) {
+    await pipeline(nodeFs.createReadStream(partPath), nodeFs.createWriteStream(outputPath, { flags: 'a' }));
+  }
 }
 
 async function transcodeRungs(input, outDir, rungs, info) {
@@ -170,7 +243,9 @@ async function writeMaster(outDir, built, hasAudio) {
 }
 
 /**
- * Transcode une vidéo en HLS multi-résolution.
+ * Seconde étape FFmpeg : la vidéo source unique est le MP4 produit par assembleMp4().
+ * Transcode ce MP4 en HLS multi-résolution. Les .part de l'upload restent dans le
+ * dossier de session (nettoyés par le GC après TTL), seuls les temporaires partent.
  *  1. 240p + 480p  -> onReady() : la vidéo est publiée, lisible tout de suite.
  *  2. 720p + 1080p -> en arrière-plan, puis onRenditions() met à jour la liste.
  */
@@ -221,5 +296,6 @@ async function processVideo(sourcePath, videoId, { onReady, onRenditions }) {
 }
 
 module.exports = {
-  assertAvailable, probe, selectLadder, renditionSize, buildHlsArgs, processVideo, LADDER,
+  assertAvailable, probe, selectLadder, renditionSize, buildHlsArgs, assembleMp4, processVideo,
+  supportedProtocols, concatPartsToFile, LADDER,
 };

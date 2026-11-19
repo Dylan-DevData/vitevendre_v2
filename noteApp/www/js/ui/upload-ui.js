@@ -104,7 +104,10 @@ export function createUploader({ onPublished, onViewProfile }) {
     const progress = `${formatBytes(snap.sent)} / ${formatBytes(snap.total)}`;
     switch (snap.state) {
       case 'hashing':
+      case 'checking-source':
         return show({ heading: 'Préparation de la vidéo…', detail: 'Vérification du fichier', spin: true, glyph: icons.film });
+      case 'reading-chunk':
+        return show({ heading: 'Lecture du morceau…', detail: progress, fraction, spin: true, glyph: icons.film });
       case 'uploading': {
         const speed = snap.speed ? `${formatBytes(snap.speed)}/s` : '';
         return show({

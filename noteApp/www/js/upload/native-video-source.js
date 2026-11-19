@@ -1,3 +1,5 @@
+import { ANDROID_MAX_CHUNK } from './chunk-sizer.js';
+
 /** Pont Cordova utilisé sur Android; dans le navigateur, la source reste un objet File. */
 export function isNativeAndroid() {
   return Boolean(window.cordova && window.cordova.platformId === 'android');
@@ -47,7 +49,10 @@ export class AndroidContentFile {
   }
 
   async read(start, end) {
-    if (start < 0 || end <= start || end > this.size || end - start > 1024 * 1024) {
+    // Le plugin natif lit seulement cette plage sur l'URI, puis la renvoie en Base64.
+    // JavaScript décode temporairement le morceau en mémoire avant le PATCH; la vidéo entière
+    // ne traverse jamais le pont Cordova. Le serveur écrit le morceau en .part pour FFmpeg.
+    if (start < 0 || end <= start || end > this.size || end - start > ANDROID_MAX_CHUNK) {
       throw new NativeSourceError('INVALID_RANGE', 'La plage de lecture Android est invalide ou trop grande.');
     }
     const result = await call('readRange', this.uri, start, end - start, this.name, this.size,

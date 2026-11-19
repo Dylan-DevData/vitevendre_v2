@@ -24,6 +24,7 @@ export function timeAgo(iso) {
 }
 
 export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 o';
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} Ko`;
   if (bytes < 1024 ** 3) return `${(bytes / 1024 / 1024).toFixed(1).replace('.', ',')} Mo`;
   return `${(bytes / 1024 ** 3).toFixed(2).replace('.', ',')} Go`;

@@ -1,10 +1,10 @@
 import { ApiError } from '../api-core.js';
 import { ChunkSizer, MAX_CHUNK, ANDROID_MAX_CHUNK } from './chunk-sizer.js';
-import { FINGERPRINT_SCHEME, SourceGoneError, computeFingerprint, openSource } from './source.js';
+import { FINGERPRINT_SCHEME, SESSION_KEY_SCHEME, SourceGoneError, computeFingerprint, openSource } from './source.js';
 import { NativeSourceError } from './native-video-source.js';
-import { checkFilePermission, checkFileReadable, readFileChunk, compareFileIdentity } from './file-verification.js';
+import { checkFilePermission, checkFileReadable, readFileChunk } from './file-verification.js';
 
-// États : idle, hashing, uploading, waiting-network, paused, processing, source-gone,
+// États : idle, checking-source, reading-chunk, uploading, waiting-network, paused, processing, source-gone,
 //         mismatch, error, cancelled.
 // Événements (CustomEvent) : "state" (detail = snapshot) et "progress" (detail = snapshot).
 
@@ -34,7 +34,7 @@ function defaultEnv() {
 
 export class UploadTask extends EventTarget {
   constructor({ file, caption = '', api, env = defaultEnv(), expectedFingerprint = null, expectedFingerprintScheme = null, resumeUploadId = null,
-    onFingerprint = async () => {}, onSession = async () => {}, onSessionInvalidated = async () => {} }) {
+    onFingerprint = async () => {}, onSession = async () => {} }) {
     super();
     this.file = file;
     this.caption = caption;
@@ -42,12 +42,11 @@ export class UploadTask extends EventTarget {
     this.env = env;
     this.expectedFingerprint = expectedFingerprint;
     this.expectedFingerprintScheme = expectedFingerprintScheme;
-    // Le pont SAF Android renvoie le morceau en Base64 : sa limite est de 1 Mio; le navigateur peut aller à 2 Mio.
+    // Android renvoie la plage en Base64; les deux clients restent plafonnés à 4 Mio par le serveur.
     this.sizer = new ChunkSizer({ max: file && file.kind === 'android-content' ? ANDROID_MAX_CHUNK : MAX_CHUNK });
     this.resumeUploadId = resumeUploadId;
     this.onFingerprint = onFingerprint;
     this.onSession = onSession;
-    this.onSessionInvalidated = onSessionInvalidated;
     this.state = 'idle';
     this.error = null;
     this.uploadId = null;
@@ -89,7 +88,7 @@ export class UploadTask extends EventTarget {
   }
 
   pause() {
-    if (['uploading', 'waiting-network'].includes(this.state)) {
+    if (['reading-chunk', 'uploading', 'waiting-network'].includes(this.state)) {
       this.paused = true;
       if (this.controller) this.controller.abort();
       this.#setState('paused');
@@ -117,20 +116,24 @@ export class UploadTask extends EventTarget {
   async start() {
     const source = openSource(this.file);
     try {
-      this.#setState('hashing');
+      this.#setState('checking-source');
       await checkFilePermission(source);
       await checkFileReadable(source);
-      // Cette empreinte aide le backend à retrouver l'envoi après une interruption.
-      this.fingerprint = await computeFingerprint(source);
-      if (this.expectedFingerprintScheme === FINGERPRINT_SCHEME && this.expectedFingerprint && this.expectedFingerprint !== this.fingerprint) {
+      // Les nouvelles tâches réutilisent leur clé aléatoire déjà sauvegardée dans IndexedDB.
+      // Ainsi l'upload démarre sans parcourir une première fois tout le fichier. Les anciennes
+      // tâches content-chain-v1 gardent leur vérification complète pour rester reprenables.
+      const hasSessionKey = this.expectedFingerprintScheme === SESSION_KEY_SCHEME && this.expectedFingerprint;
+      this.fingerprint = hasSessionKey ? this.expectedFingerprint : await computeFingerprint(source);
+      if (!hasSessionKey && this.expectedFingerprintScheme === FINGERPRINT_SCHEME
+        && this.expectedFingerprint && this.expectedFingerprint !== this.fingerprint) {
         const error = new Error('Ce fichier n’est pas celui de l’envoi interrompu.');
         this.#setState('mismatch', error.message);
         throw error;
       }
-      await this.onFingerprint(this.fingerprint);
+      await this.onFingerprint(this.fingerprint, hasSessionKey ? SESSION_KEY_SCHEME : FINGERPRINT_SCHEME);
 
-      // Après un redémarrage Android, privilégie l'identifiant persisté ; sinon le POST déduplique
-      // une session active par empreinte (utile également au navigateur après nouvelle sélection).
+      // Après un redémarrage Android, privilégie l'identifiant de session persisté. La clé stable
+      // de tâche rend aussi un POST réessayé idempotent si sa première réponse a été perdue.
       let session = null;
       if (this.resumeUploadId) {
         try {
@@ -170,25 +173,11 @@ export class UploadTask extends EventTarget {
       await this.#transfer(source);
       if (this.cancelled) return null;
 
-      // La source peut changer pendant la lecture des morceaux. Recalculer son empreinte avant
-      // la finalisation détecte ce changement; seul un bloc borné est conservé en mémoire.
-      this.#setState('hashing');
+      // Vérifie les droits et métadonnées avant l'assemblage sans relire les octets déjà envoyés.
+      // Android contrôle taille, date et emplacement à chaque lecture de plage; côté Web,
+      // File est un objet Blob immuable et FileSource vérifie sa taille à chaque lecture.
+      this.#setState('checking-source');
       await checkFilePermission(source);
-      if (!(await compareFileIdentity(source, this.fingerprint))) {
-        const message = 'Cette vidéo a été modifiée pendant l’envoi. Sélectionne le fichier original pour reprendre.';
-        // Ne jamais réutiliser une session qui pourrait mélanger des morceaux de deux versions du fichier.
-        if (this.uploadId) {
-          try {
-            await this.#retry(() => this.api.abortUpload(this.uploadId));
-          } catch (abortError) {
-            if (!(abortError instanceof ApiError && abortError.status === 404)) throw abortError;
-          }
-          this.uploadId = null;
-          await this.onSessionInvalidated();
-        }
-        this.#setState('mismatch', message);
-        throw new Error(message);
-      }
 
       const done = await this.#complete();
       this.videoId = done.videoId || this.videoId;
@@ -246,7 +235,6 @@ export class UploadTask extends EventTarget {
   }
 
   async #transfer(source) {
-    this.#setState('uploading');
     let failures = 0;
     while (this.sent < this.total) {
       await this.#waitIfPaused();
@@ -256,9 +244,18 @@ export class UploadTask extends EventTarget {
 
       const start = this.sent;
       const end = Math.min(start + this.sizer.next(), this.total);
+      // La lecture Android passe par le pont Cordova et Base64; l'indiquer séparément
+      // évite de faire croire que le réseau est bloqué avant même le premier PATCH.
+      this.#setState('reading-chunk');
       // L'offset confirmé par le serveur marque le début de la prochaine tranche à lire.
-      // Lecture d'une seule tranche : une erreur ici = fichier perdu, pas un problème réseau.
+      // Cette tranche est une plage d'octets arbitraire, pas un petit fichier vidéo autonome.
+      // Le client la lit puis l'envoie; seul le serveur la nomme et la persiste en .part.
+      // Une erreur de lecture ici signifie que la source locale est inaccessible, pas le réseau.
       const bytes = await readFileChunk(source, start, end);
+      await this.#waitIfPaused();
+      if (this.cancelled) return;
+      await this.#waitOnline();
+      this.#setState('uploading');
 
       this.controller = new AbortController();
       const requestController = this.controller;
@@ -267,7 +264,8 @@ export class UploadTask extends EventTarget {
       const timeout = setTimeout(() => requestController.abort(), Math.max(20000, (bytes.length / 8192) * 1000));
       const t0 = this.env.now();
       try {
-        // Le corps de cette requête contient uniquement `bytes`, jamais le fichier complet.
+        // Le PATCH contient uniquement `bytes`. Le backend enregistre ce bloc confirmé
+        // comme <uploadId>.<chunkNumber>.part et garde sa référence/son offset en base.
         const result = await this.api.patchChunk(this.uploadId, start, bytes, requestController.signal);
         if (result.status === 409 && result.data && Number.isFinite(result.data.receivedBytes)) {
           // Le serveur est la source de vérité : on se recale sur son offset.
@@ -321,7 +319,8 @@ export class UploadTask extends EventTarget {
   async #complete() {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        // Le backend valide le fichier assemblé sur disque, puis l'envoie à la file FFmpeg.
+        // Quand tous les .part sont confirmés, le backend demande à FFmpeg de lire
+        // leur flux dans l'ordre et de créer un MP4; la file traite ensuite ce MP4 en HLS.
         return await this.#retry(() => this.api.completeUpload(this.uploadId));
       } catch (error) {
         // Octets manquants (rare) : on se recale puis on renvoie la fin.
@@ -329,15 +328,7 @@ export class UploadTask extends EventTarget {
           await this.#resync();
           const source = openSource(this.file);
           await this.#transfer(source);
-          if (!(await compareFileIdentity(source, this.fingerprint))) {
-            const message = 'Cette vidéo a été modifiée pendant l’envoi. Sélectionne le fichier original pour reprendre.';
-            try { await this.#retry(() => this.api.abortUpload(this.uploadId)); }
-            catch (abortError) { if (!(abortError instanceof ApiError && abortError.status === 404)) throw abortError; }
-            this.uploadId = null;
-            await this.onSessionInvalidated();
-            this.#setState('mismatch', message);
-            throw new Error(message);
-          }
+          await checkFilePermission(source);
           continue;
         }
         throw error;

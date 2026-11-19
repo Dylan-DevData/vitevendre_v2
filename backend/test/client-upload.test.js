@@ -22,7 +22,15 @@ test('sha256 JS pur = crypto natif', async () => {
   }
 });
 
-test('ChunkSizer : monte doucement, retombe à 512 Ko après un échec', async () => {
+test('Clé de session : 64 caractères hexadécimaux indépendants', async () => {
+  const { createSessionKey } = await client('upload/source.js');
+  const first = createSessionKey();
+  const second = createSessionKey();
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.notEqual(first, second);
+});
+
+test('ChunkSizer : démarre avec une tranche courte puis suit le débit', async () => {
   const { ChunkSizer, MIN_CHUNK, MAX_CHUNK } = await client('upload/chunk-sizer.js');
   const sizer = new ChunkSizer();
   assert.equal(sizer.next(), MIN_CHUNK);
@@ -31,8 +39,65 @@ test('ChunkSizer : monte doucement, retombe à 512 Ko après un échec', async (
   sizer.onFailure();
   assert.equal(sizer.next(), MIN_CHUNK);
   const slow = new ChunkSizer();
-  for (let i = 0; i < 10; i += 1) slow.onSuccess(slow.next(), 8000); // ~64 Ko/s
+  for (let i = 0; i < 10; i += 1) slow.onSuccess(slow.next(), 1000); // ~512 Kio/s : reste au minimum
   assert.equal(slow.next(), MIN_CHUNK);
+  const changing = new ChunkSizer();
+  for (let i = 0; i < 20; i += 1) changing.onSuccess(changing.next(), 100); // réseau très rapide
+  assert.equal(changing.next(), MAX_CHUNK);
+  changing.onSuccess(changing.next(), 8000); // le débit tombe à ~512 Kio/s
+  assert.equal(changing.next(), MIN_CHUNK);
+  assert.equal(MIN_CHUNK, 512 * 1024);
+});
+
+test('UploadTask : affiche la lecture puis confirme rapidement le premier petit morceau', async () => {
+  const { UploadTask } = await client('upload/upload-task.js');
+  const { MIN_CHUNK } = await client('upload/chunk-sizer.js');
+  const { SESSION_KEY_SCHEME } = await client('upload/source.js');
+  const sourceBytes = new Uint8Array(700 * 1024);
+  const blob = new Blob([sourceBytes], { type: 'video/mp4' });
+  const readSizes = [];
+  const sessionKey = 'a'.repeat(64);
+  const file = {
+    name: 'test.mp4', type: 'video/mp4', size: sourceBytes.length,
+    slice: (start, end) => { readSizes.push(end - start); return blob.slice(start, end); },
+  };
+  const patchSizes = [];
+  const states = [];
+  const api = {
+    createUpload: async (body) => {
+      assert.equal(body.fingerprint, sessionKey);
+      return { uploadId: 'upload-test', videoId: 1, status: 'in_progress', receivedBytes: 0, maxChunkBytes: 4 * 1024 * 1024 };
+    },
+    patchChunk: async (_id, offset, bytes) => {
+      patchSizes.push(bytes.length);
+      return { status: 200, data: { receivedBytes: offset + bytes.length } };
+    },
+    completeUpload: async () => ({ videoId: 1 }),
+  };
+  let now = 0;
+  const task = new UploadTask({
+    file,
+    api,
+    expectedFingerprint: sessionKey,
+    expectedFingerprintScheme: SESSION_KEY_SCHEME,
+    env: { isOnline: () => true, waitOnline: async () => {}, sleep: async () => {}, now: () => { now += 10; return now; } },
+  });
+  task.addEventListener('state', (event) => states.push(event.detail.state));
+
+  await task.start();
+
+  assert.equal(patchSizes[0], MIN_CHUNK);
+  assert.ok(states.includes('reading-chunk'));
+  assert.ok(states.includes('uploading'));
+  assert.equal(task.sent, sourceBytes.length);
+  // Une seule vérification de lisibilité (1 octet), puis les tranches réellement envoyées;
+  // aucun parcours complet supplémentaire n'est fait avant le premier PATCH.
+  assert.equal(readSizes.reduce((sum, size) => sum + size, 0), sourceBytes.length + 1);
+});
+
+test('formatBytes montre zéro octet sans inventer 1 Ko', async () => {
+  const { formatBytes } = await client('ui/dom.js');
+  assert.equal(formatBytes(0), '0 o');
 });
 
 test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip, timeout: 120000 }, async (t) => {
@@ -53,7 +118,7 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   const { UploadTask } = await client('upload/upload-task.js');
   const { FINGERPRINT_SCHEME } = await client('upload/source.js');
 
-  // Vidéo de ~6 Mo : plusieurs morceaux de 512 Ko à 2 Mo.
+  // Vidéo de ~6 Mo : premier morceau de 512 Kio, puis taille adaptée jusqu'à 4 Mio.
   const src = path.join(root, 'in.mp4');
   execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=720x1280:r=25:d=4',
     '-c:v', 'libx264', '-b:v', '12M', '-pix_fmt', 'yuv420p', src]);
@@ -121,20 +186,24 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   assert.equal(status.status, 'in_progress');
   assert.equal(status.receivedBytes, task1.sent);
   const saved = await pool.query(
-    `SELECT video_id, chunk_number, byte_offset, chunk_size, data
+    `SELECT video_id, chunk_number, part_name
      FROM upload_chunks WHERE upload_id = $1 ORDER BY chunk_number`,
     [firstSession]
   );
   let savedOffset = 0;
+  const savedParts = [];
   saved.rows.forEach((chunk, index) => {
     assert.equal(Number(chunk.video_id), task1.videoId);
     assert.equal(Number(chunk.chunk_number), index);
-    assert.equal(Number(chunk.byte_offset), savedOffset);
-    assert.equal(Number(chunk.chunk_size), chunk.data.length);
-    savedOffset += chunk.data.length;
+    assert.equal(chunk.part_name, `${index}.part`);
+    const part = fs.readFileSync(path.join(process.env.UPLOAD_DIR, 'sessions', firstSession, chunk.part_name));
+    savedOffset += part.length;
+    savedParts.push(part);
   });
   assert.equal(savedOffset, status.receivedBytes);
-  assert.ok(Buffer.concat(saved.rows.map((chunk) => chunk.data)).equals(bytes.subarray(0, status.receivedBytes)));
+  assert.ok(Buffer.concat(savedParts).equals(bytes.subarray(0, status.receivedBytes)));
+  const metadataPath = path.join(process.env.UPLOAD_DIR, 'sessions', firstSession, 'meta.json');
+  assert.deepEqual(JSON.parse(fs.readFileSync(metadataPath, 'utf8')), { totalSize: bytes.length });
 
   // --- Envoi 2 : même fichier RENOMMÉ -> même session, reprise sans renvoyer l'existant. ---
   const renamed = new File([bytes], 'autre-nom.mp4', { type: 'video/mp4' });
@@ -148,6 +217,9 @@ test('UploadTask : coupures, hors-ligne, fichier supprimé puis reprise', { skip
   assert.ok(result.videoId > 0);
   assert.equal(task2.state, 'processing');
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [firstSession])).rows[0].n, 0);
+  assert.ok(fs.existsSync(metadataPath), 'les métadonnées de session restent disponibles après assemblage');
+  // Les .part sont des fichiers persistants : ils RESTENT après l'assemblage (jusqu'au GC).
+  saved.rows.forEach((chunk) => assert.ok(fs.existsSync(path.join(process.env.UPLOAD_DIR, 'sessions', firstSession, chunk.part_name)), `${chunk.part_name} doit rester après l'assemblage`));
 
   // --- Mauvais fichier : l'empreinte détecte que ce n'est pas le même. ---
   const other = new File([crypto.randomBytes(200000)], 'x.mp4', { type: 'video/mp4' });

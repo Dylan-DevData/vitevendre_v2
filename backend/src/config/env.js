@@ -29,7 +29,10 @@ if (uploadChunkMaxBytes < 64 * 1024 || uploadChunkMaxBytes > 16 * 1024 * 1024) {
   throw new Error('UPLOAD_CHUNK_MAX_BYTES doit être compris entre 65536 et 16777216 octets.');
 }
 
-const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, '..', '..', 'uploads');
+// Dossiers résolus en absolu dès la lecture de la config : un chemin relatif (.env
+// "UPLOAD_DIR=./uploads") serait sinon interprété différemment par Node et par FFmpeg,
+// dont le répertoire courant est uploads/sessions pendant l'assemblage.
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '..', '..', 'uploads'));
 
 module.exports = {
   nodeEnv: process.env.NODE_ENV || 'development',
@@ -38,9 +41,9 @@ module.exports = {
   jwtSecret: process.env.JWT_SECRET,
   corsOrigin: process.env.CORS_ORIGIN || '*',
   uploadDir,
-  sessionsDir: path.join(uploadDir, 'sessions'), // nettoyage des anciens fichiers .tmp
+  sessionsDir: path.join(uploadDir, 'sessions'), // morceaux d'upload .part et fichiers temporaires
   sourcesDir: path.join(uploadDir, 'sources'),   // vidéo complète en attente de transcodage
-  mediaDir: process.env.MEDIA_DIR || path.join(__dirname, '..', '..', 'media'),
+  mediaDir: path.resolve(process.env.MEDIA_DIR || path.join(__dirname, '..', '..', 'media')),
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
   ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
   maxVideoBytes,

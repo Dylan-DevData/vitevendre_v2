@@ -23,7 +23,7 @@
 | Ajouter une vidéo pendant deux uploads actifs | À exécuter sur appareil |
 | Couper le réseau, relancer l’app, reprendre aux offsets serveur | À exécuter sur appareil |
 | Supprimer ou révoquer une source, vérifier son état et le message | À exécuter sur appareil |
-| Réassocier le bon fichier et refuser une empreinte différente | À exécuter sur appareil |
+| Reprendre une URI Android et vérifier ses droits et métadonnées | À exécuter sur appareil |
 | Annuler B pendant que A continue | À exécuter sur appareil |
 | Perdre la réponse de finalisation, vérifier que les métadonnées restent | À exécuter sur appareil |
 | Confirmer `video.ready`, vérifier le nettoyage IndexedDB et le grant | À exécuter sur appareil |

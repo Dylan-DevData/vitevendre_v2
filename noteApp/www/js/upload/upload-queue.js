@@ -2,13 +2,17 @@ import { UploadTask } from './upload-task.js';
 import { uploadStorage } from './storage.js';
 import { isNativeAndroid, releaseAndroidUri } from './native-video-source.js';
 import { reopenFile } from './file-verification.js';
-import { FINGERPRINT_SCHEME } from './source.js';
+import { FINGERPRINT_SCHEME, SESSION_KEY_SCHEME, createSessionKey } from './source.js';
 
 const uid = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const FINAL_FILE_STATES = new Set(['missing_file', 'inaccessible_file', 'moved_file', 'mismatch']);
 const isNotFound = (error) => error?.status === 404;
 
-/** File persistante de métadonnées; les références File d'exécution restent en mémoire. */
+/**
+ * File persistante de métadonnées : IndexedDB conserve l'URI Android, les infos du fichier,
+ * l'uploadId et l'avancement confirmé. Les octets/File/Blob ne sont jamais enregistrés dans
+ * IndexedDB; la référence URI permet de rouvrir la source après fermeture ou reconnexion.
+ */
 export class UploadQueue extends EventTarget {
   constructor({ api, concurrency = 2 } = {}) {
     super();
@@ -42,6 +46,12 @@ export class UploadQueue extends EventTarget {
         if (meta.uri) releaseAndroidUri(meta.uri).catch(() => {});
         await uploadStorage.remove(meta.id);
         continue;
+      }
+      // Les anciennes tâches hachaient toute la vidéo avant l'envoi. L'uploadId conservé
+      // suffit pour reprendre; remplacer leur clé par une clé de tâche évite ce scan coûteux.
+      if (meta.uploadSessionId && meta.fingerprintScheme === FINGERPRINT_SCHEME) {
+        meta.fingerprint = createSessionKey();
+        meta.fingerprintScheme = SESSION_KEY_SCHEME;
       }
       const signature = meta.uri ? `uri:${meta.uri}` : `file:${meta.name}:${meta.size}:${meta.lastModified || 0}`;
       const job = { meta, file: null, task: null, state: meta.status, signature, error: meta.lastError || null };
@@ -78,7 +88,10 @@ export class UploadQueue extends EventTarget {
       id: uid(), name: file.name || 'video', uri: file.uri || '', uriType: file.uri ? 'content' : 'file',
       sourceLocation: file.sourceLocation || null,
       mimeType: file.type || file.mimeType || 'video/mp4', size: Number(file.size), lastModified: file.lastModified || null,
-      fingerprint: file.fingerprint || '', fingerprintScheme: '', uploadSessionId: '', uploadedBytes: 0, status: 'queued', retryCount: 0,
+      // La clé est persistée avec l'URI avant l'envoi. Elle rend la création de session
+      // idempotente sans relire toute la vidéo pour calculer une empreinte de contenu.
+      fingerprint: createSessionKey(), fingerprintScheme: SESSION_KEY_SCHEME,
+      uploadSessionId: '', uploadedBytes: 0, status: 'queued', retryCount: 0,
       permissionPersisted: Boolean(file.permissionPersisted), caption, videoId: null, queueOrder: this.order.length,
     };
     const job = { meta, file, task: null, state: 'queued', signature, error: null };
@@ -89,6 +102,14 @@ export class UploadQueue extends EventTarget {
   async reassociate(id, file) {
     const job = this.jobs.get(id);
     if (!job) throw new Error('Tâche d’envoi introuvable.');
+    // Une source remplacée reçoit une nouvelle clé et une nouvelle session; on ne mélange
+    // jamais ses morceaux avec ceux de l'ancien fichier associé à cette tâche.
+    this.cleanupSession(job);
+    job.meta.fingerprint = createSessionKey();
+    job.meta.fingerprintScheme = SESSION_KEY_SCHEME;
+    job.meta.uploadSessionId = '';
+    job.meta.uploadedBytes = 0;
+    job.meta.videoId = null;
     job.file = file; job.meta.uri = file.uri || ''; job.meta.uriType = file.uri ? 'content' : 'file';
     job.meta.name = file.name; job.meta.size = file.size; job.meta.mimeType = file.type || 'video/mp4';
     job.meta.lastModified = file.lastModified ?? null;
@@ -174,22 +195,18 @@ export class UploadQueue extends EventTarget {
 
   run(job) {
     const id = job.meta.id;
-    this.active.add(id); job.state = 'hashing'; job.error = null;
+    this.active.add(id); job.state = 'checking-source'; job.error = null;
     const task = new UploadTask({ file: job.file, caption: job.meta.caption || '', api: this.api,
-      expectedFingerprint: job.meta.fingerprintScheme === FINGERPRINT_SCHEME ? job.meta.fingerprint : null,
+      expectedFingerprint: job.meta.fingerprint || null,
       expectedFingerprintScheme: job.meta.fingerprintScheme || null,
       resumeUploadId: job.meta.uploadSessionId || null,
-      onFingerprint: async (fingerprint) => {
-        job.meta.fingerprint = fingerprint; job.meta.fingerprintScheme = FINGERPRINT_SCHEME;
+      onFingerprint: async (fingerprint, scheme) => {
+        job.meta.fingerprint = fingerprint; job.meta.fingerprintScheme = scheme || FINGERPRINT_SCHEME;
         await uploadStorage.put(job.meta);
       },
       onSession: async (session) => {
         job.meta.uploadSessionId = session.uploadId; job.meta.videoId = session.videoId;
         job.meta.uploadedBytes = session.receivedBytes; await uploadStorage.put(job.meta);
-      },
-      onSessionInvalidated: async () => {
-        job.meta.uploadSessionId = ''; job.meta.videoId = null; job.meta.uploadedBytes = 0;
-        await uploadStorage.put(job.meta);
       },
     });
     job.task = task;

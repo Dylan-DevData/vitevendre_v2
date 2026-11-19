@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS videos (
   caption       TEXT NOT NULL DEFAULT '' CHECK (char_length(caption) <= 300),
   status        TEXT NOT NULL DEFAULT 'uploading'
                 CHECK (status IN ('uploading', 'processing', 'ready', 'failed')),
-  source_name   TEXT,                       -- fichier source dans uploads/sources/
+  source_name   TEXT,                       -- MP4 source dans uploads/sources/
   width         INTEGER,                    -- dimensions affichées (rotation appliquée)
   height        INTEGER,
   duration_s    NUMERIC(8, 2),
@@ -41,24 +41,39 @@ CREATE INDEX IF NOT EXISTS idx_videos_user ON videos (user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_processing ON videos (id) WHERE status = 'processing';
 
 -- ---------- Sessions d'envoi (upload reprenable par offset) ----------
--- Les octets des morceaux sont conservés dans upload_chunks. received_bytes est
--- avancé dans la même transaction que l'insertion du morceau correspondant.
--- fingerprint = signature chaînée de blocs de contenu + taille totale,
--- indépendante du nom : les blocs sont lus bornés en mémoire pour reconnaître le fichier.
+-- Les fichiers des morceaux sont stockés sous uploads/sessions/*.part.
+-- PostgreSQL conserve seulement les références des morceaux; octets et tailles sont
+-- sur disque. L'offset de reprise est calculé depuis les fichiers .part.
+-- fingerprint contient une clé de tâche aléatoire (session-key-v2) pour rendre POST idempotent.
+-- Les anciennes tâches content-chain-v1 restent acceptées pendant leur reprise.
 CREATE TABLE IF NOT EXISTS uploads (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   video_id        BIGINT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
   mime_type       TEXT NOT NULL,
-  total_size      BIGINT NOT NULL CHECK (total_size > 0),
-  received_bytes  BIGINT NOT NULL DEFAULT 0 CHECK (received_bytes >= 0),
   fingerprint     CHAR(64) NOT NULL,
   status          TEXT NOT NULL DEFAULT 'in_progress'
                   CHECK (status IN ('in_progress', 'complete', 'aborted')),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (received_bytes <= total_size)
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Taille totale et offset sont conservés dans le fichier de session .meta.json;
+-- retirer les anciennes colonnes SQL après db:init les avoir exportées sur disque.
+DO $$
+DECLARE constraint_row RECORD;
+BEGIN
+  FOR constraint_row IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = 'uploads'::regclass
+      AND contype = 'c'
+      AND lower(pg_get_constraintdef(oid)) ~ '(total_size|received_bytes)'
+  LOOP
+    EXECUTE format('ALTER TABLE uploads DROP CONSTRAINT %I', constraint_row.conname);
+  END LOOP;
+END $$;
+ALTER TABLE uploads DROP COLUMN IF EXISTS total_size;
+ALTER TABLE uploads DROP COLUMN IF EXISTS received_bytes;
 
 -- Une seule session active par utilisateur et par fichier.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_uploads_active_fingerprint
@@ -69,30 +84,39 @@ CREATE INDEX IF NOT EXISTS idx_uploads_activity ON uploads (updated_at) WHERE st
 -- correspond bien à la vidéo de sa session d'upload.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_uploads_id_video_id ON uploads (id, video_id);
 
--- Un morceau = une ligne BYTEA. Le numéro suit l'ordre d'arrivée; byte_offset
--- et chunk_size permettent de contrôler qu'il n'y a ni trou ni chevauchement.
+-- Une ligne de morceau conserve uniquement son association et sa référence de fichier.
 CREATE TABLE IF NOT EXISTS upload_chunks (
   upload_id     UUID NOT NULL,
   video_id      BIGINT NOT NULL,
   chunk_number  BIGINT NOT NULL CHECK (chunk_number >= 0),
-  byte_offset   BIGINT NOT NULL CHECK (byte_offset >= 0),
-  chunk_size    INTEGER NOT NULL CHECK (chunk_size > 0),
-  data          BYTEA NOT NULL,
+  part_name     TEXT NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (upload_id, chunk_number),
   FOREIGN KEY (upload_id, video_id)
-    REFERENCES uploads (id, video_id) ON DELETE CASCADE,
-  CHECK (octet_length(data) = chunk_size)
+    REFERENCES uploads (id, video_id) ON DELETE CASCADE
 );
 
--- Les sessions commencées avant cette migration avaient leurs octets sur disque.
--- Elles repartent de zéro une seule fois; celles ayant déjà des lignes de morceaux
--- gardent leur offset, même si db:init est relancé.
-UPDATE uploads u
-SET received_bytes = 0
-WHERE u.status = 'in_progress'
-  AND u.received_bytes > 0
-  AND NOT EXISTS (SELECT 1 FROM upload_chunks c WHERE c.upload_id = u.id);
+-- Migration: db:init exporte d'abord les anciens BYTEA en .part. On remplit les
+-- références manquantes, puis on supprime le stockage binaire et ses tailles SQL.
+ALTER TABLE upload_chunks ADD COLUMN IF NOT EXISTS part_name TEXT;
+DO $$
+DECLARE constraint_row RECORD;
+BEGIN
+  FOR constraint_row IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = 'upload_chunks'::regclass
+      AND contype = 'c'
+      AND lower(pg_get_constraintdef(oid)) ~ '(data|chunk_size|byte_offset)'
+  LOOP
+    EXECUTE format('ALTER TABLE upload_chunks DROP CONSTRAINT %I', constraint_row.conname);
+  END LOOP;
+END $$;
+UPDATE upload_chunks
+SET part_name = upload_id::text || '.' || chunk_number::text || '.part';
+ALTER TABLE upload_chunks ALTER COLUMN part_name SET NOT NULL;
+ALTER TABLE upload_chunks DROP COLUMN IF EXISTS data;
+ALTER TABLE upload_chunks DROP COLUMN IF EXISTS chunk_size;
+ALTER TABLE upload_chunks DROP COLUMN IF EXISTS byte_offset;
 
 -- ---------- J'aime ----------
 CREATE TABLE IF NOT EXISTS video_likes (

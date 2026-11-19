@@ -35,13 +35,13 @@ cordova run android
 ## Ce que fait le système
 
 **Upload (client → serveur)** — détail du protocole dans `backend/API_UPLOAD.md`
-- Le fichier n'est jamais chargé en mémoire : le client lit une tranche à la fois avec `file.slice()`.
-- Taille de morceau adaptative de 512 Ko à 2 Mo : +256 Ko après deux succès si le débit le permet, retour à 512 Ko après une coupure.
-- Empreinte = SHA-256 des 64 premiers Ko + 64 derniers Ko + taille exacte. Renommer le fichier ne change rien ; un fichier différent est détecté.
+- Le fichier complet n'est jamais chargé en mémoire : le client lit une tranche à la fois avec `file.slice()` (la tranche courante est temporairement en mémoire).
+- Taille adaptative de 512 Ko à 4 Mo sur le web et Android : le débit faible garde des tranches de 512 Ko; les transferts rapides montent progressivement jusqu'à 4 Mo; après une coupure, la taille revient à 512 Ko.
+- Une clé aléatoire propre à la tâche est enregistrée dans IndexedDB avec l'URI et l'`uploadId`. Les nouvelles tâches n'ont plus besoin de lire toute la vidéo pour calculer une empreinte avant de commencer; les anciennes empreintes complètes restent compatibles.
 - Reprise : le serveur est la source de vérité (`receivedBytes`). Après coupure, le client l'interroge et repart à cet octet, sans renvoyer ce qui est validé.
 - Fichier supprimé ou déplacé pendant une pause : la lecture échoue, l'envoi s'arrête proprement et l'utilisateur est prévenu. Il peut resélectionner le fichier pour reprendre.
-- Côté serveur, chaque morceau est stocké dans `upload_chunks` (PostgreSQL) avec son numéro, son offset et son `videoId`. L'insertion et l'avancement de `receivedBytes` sont validés ensemble.
-- À la fin, le backend assemble les morceaux depuis PostgreSQL en un fichier source, puis supprime les lignes de morceaux après vérification. Une session sans activité depuis 24 h et ses morceaux sont supprimés automatiquement.
+- Côté serveur, chaque morceau est stocké dans `uploads/sessions/<uploadId>.<n>.part`; PostgreSQL garde seulement l'association et le nom de référence. Le total est dans un petit fichier de session et `receivedBytes` est calculé depuis les tailles des `.part`.
+- À la fin, FFmpeg lit directement les `.part` dans l’ordre pour produire un MP4 dans `uploads/sources/`, puis le traitement HLS démarre. Après validation, les fichiers et lignes des morceaux sont supprimés. Une session inactive depuis 24 h et ses morceaux sont supprimés automatiquement.
 
 **Transcodage (serveur)**
 - Une seule commande FFmpeg décode la source une fois et produit HLS 240p, 480p, 720p et 1080p (jamais au-dessus de la source).

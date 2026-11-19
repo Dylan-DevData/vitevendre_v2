@@ -14,17 +14,18 @@ Toutes les routes `/api/uploads` exigent `Authorization: Bearer <jwt>`.
 
 ## Stockage des morceaux et reprise
 
-- Chaque morceau est une ligne de `upload_chunks`, liée à `upload_id` et `video_id`, avec `chunk_number`, `byte_offset`, `chunk_size` et les octets dans `data BYTEA`.
-- L'insertion du morceau et l'avancement de `uploads.received_bytes` se font dans la même transaction PostgreSQL. Un morceau interrompu avant sa réception complète n'est pas enregistré et l'offset ne bouge pas.
+- Chaque morceau confirmé est un fichier `uploads/sessions/<uploadId>.<chunkNumber>.part`. La ligne `upload_chunks` garde seulement `upload_id`, `video_id`, `chunk_number` et `part_name`.
+- La taille attendue est dans `<uploadId>.meta.json`; les tailles réelles et `receivedBytes` sont calculés depuis les fichiers référencés, jamais enregistrés en base.
+- Le fichier est déplacé depuis un fichier temporaire avant d'inscrire sa référence dans PostgreSQL. Un morceau interrompu avant sa réception complète n'est pas référencé et n'avance pas l'offset calculé.
 - Les morceaux sont acceptés dans l'ordre. À une coupure, le client demande `GET /api/uploads/:id` et reprend depuis `receivedBytes`. Un morceau déjà validé ne sera pas ajouté deux fois.
-- Lors de la finalisation, le backend relit les lignes une par une dans l'ordre, vérifie les offsets et la taille, puis assemble un fichier source temporaire. Après validation et renommage du fichier, la transaction finale passe l'upload à `complete`, met la vidéo en `processing` et supprime les lignes de morceaux.
-- Le serveur ne charge pas toute la vidéo en mémoire : il garde le morceau courant durant son insertion, puis relit les morceaux un par un pendant l'assemblage.
+- Lors de la finalisation, le backend vérifie les références, offsets et tailles, puis prépare un manifeste ordonné. FFmpeg lit directement les `.part` comme un seul flux et remuxe le MP4 (ou réencode les codecs incompatibles) avant le transcodage HLS.
+- Le serveur ne charge pas toute la vidéo en mémoire : il garde le morceau courant durant sa réception, puis lit les fichiers un par un pendant l'assemblage.
 - Chaque vidéo a un `videoId` et un `uploadId` propres. Les morceaux ne peuvent pas être associés à la mauvaise vidéo : la base vérifie le couple session/vidéo.
 
 ## Règles pour le client
 
-- **fingerprint** = signature SHA-256 calculée par le client sur des blocs de contenu et la taille totale, indépendante du nom. Elle permet de reprendre le même fichier renommé et de distinguer un fichier remplacé.
-- Taille de morceau libre entre 1 octet et `maxChunkBytes` (4 Mo par défaut). Le client l'adapte au débit : 512 Ko à 2 Mo dans le navigateur, et au plus 1 Mo sur Android pour borner le pont natif.
+- **fingerprint** = clé aléatoire stable pour cette tâche, sauvegardée dans IndexedDB. Elle rend `POST /api/uploads` idempotent après une coupure et évite de lire toute la vidéo avant l'envoi; elle ne constitue pas une empreinte d'intégrité du contenu. Les anciennes tâches avec une signature SHA-256 du contenu restent compatibles.
+- Taille de morceau libre entre 1 octet et `maxChunkBytes` (4 Mio par défaut). Le client démarre à 512 Kio; sous environ 512 Kio/s il garde cette taille, puis l'adapte au débit mesuré jusqu'à 4 Mio sur le navigateur comme sur Android.
 - Après toute erreur réseau : `GET /api/uploads/:id`, puis reprise à `receivedBytes`.
 
 ## Qualités HLS
@@ -36,10 +37,10 @@ sont ajoutés ensuite : le `master.m3u8` est alors réécrit et `renditions` mis
 ## Nettoyage
 
 Une session sans activité depuis 24 h (`UPLOAD_SESSION_TTL_HOURS`) est supprimée toutes les heures (`GC_INTERVAL_MINUTES`).
-Les morceaux associés sont supprimés par cascade PostgreSQL. Les lignes de morceaux d'un upload réussi sont supprimées
-après l'assemblage du fichier source; les métadonnées de session et de vidéo restent en base.
+Les références des morceaux sont supprimées par cascade PostgreSQL et leurs fichiers `.part` sont supprimés avec la session. Le fichier de taille de session est supprimé quand la session est annulée ou arrive à expiration.
+Après un upload réussi, les lignes et fichiers temporaires des morceaux sont supprimés; les métadonnées de session et de vidéo restent en base.
 
 ## Remarque d'exploitation
 
-Les morceaux vidéo occupent temporairement PostgreSQL. Ils sont supprimés à la finalisation, mais les sauvegardes et le
-journal PostgreSQL peuvent conserver leur historique selon la configuration de la base.
+Les morceaux vidéo occupent temporairement `uploads/sessions`; prévoir assez d'espace disque pour les sessions actives.
+La commande `npm run db:init` migre les anciennes données `BYTEA` vers les `.part` avant de supprimer les colonnes contenant les octets, offsets et tailles des morceaux.

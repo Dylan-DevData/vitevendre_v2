@@ -109,27 +109,55 @@ test('upload reprenable + HLS multi-résolution + GC', { skip, timeout: 240000 }
     offset = r.data.receivedBytes;
   }
   const storedChunks = await pool.query(
-    `SELECT video_id, chunk_number, byte_offset, chunk_size, data
+    `SELECT video_id, chunk_number, part_name
      FROM upload_chunks WHERE upload_id = $1 ORDER BY chunk_number`,
     [uploadId]
   );
   let storedOffset = 0;
+  const diskParts = [];
   storedChunks.rows.forEach((chunk, index) => {
     assert.equal(Number(chunk.video_id), created.data.videoId);
     assert.equal(Number(chunk.chunk_number), index);
-    assert.equal(Number(chunk.byte_offset), storedOffset);
-    assert.equal(Number(chunk.chunk_size), chunk.data.length);
-    storedOffset += chunk.data.length;
+    assert.equal(chunk.part_name, `${index}.part`);
+    const part = fs.readFileSync(path.join(process.env.UPLOAD_DIR, 'sessions', uploadId, chunk.part_name));
+    assert.ok(part.length > 0);
+    storedOffset += part.length;
+    diskParts.push(part);
   });
   assert.equal(storedOffset, bytes.length);
-  assert.ok(Buffer.concat(storedChunks.rows.map((chunk) => chunk.data)).equals(bytes), 'les morceaux en base doivent reconstituer la vidéo');
-  const sessionFile = path.join(process.env.UPLOAD_DIR, 'sessions', `${uploadId}.tmp`);
-  assert.equal(fs.existsSync(sessionFile), false);
+  assert.ok(Buffer.concat(diskParts).equals(bytes), 'les références .part doivent reconstituer la vidéo');
+  const chunkColumns = await pool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'upload_chunks'`
+  );
+  assert.deepEqual(chunkColumns.rows.map((row) => row.column_name).sort(),
+    ['chunk_number', 'created_at', 'part_name', 'upload_id', 'video_id']);
+  const uploadColumns = await pool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'uploads'`
+  );
+  assert.ok(!uploadColumns.rows.some((row) => ['total_size', 'received_bytes'].includes(row.column_name)));
+  const sessionDir = path.join(process.env.UPLOAD_DIR, 'sessions', uploadId);
+  const sessionEntries = fs.readdirSync(sessionDir);
+  // Pendant l'envoi : les .part + meta.json vivent dans le dossier de session, aucun .tmp égaré.
+  assert.ok(sessionEntries.includes('meta.json'));
+  assert.ok(sessionEntries.includes('0.part'));
+  assert.equal(sessionEntries.some((name) => name.endsWith('.tmp')), false);
+  const metadataFile = path.join(sessionDir, 'meta.json');
+  assert.deepEqual(JSON.parse(fs.readFileSync(metadataFile, 'utf8')), { totalSize: bytes.length });
 
   r = await call('POST', `/api/uploads/${uploadId}/complete`, { token });
   assert.equal(r.status, 202);
   const videoId = r.data.videoId;
-  assert.equal(fs.existsSync(sessionFile), false);
+  // Après l'assemblage réussi : les temporaires sont partis, .part + meta.json + le
+  // manifeste concat.tmp (inputPath de FFmpeg) RESTENT — la session est ré-assemblable,
+  // et le GC nettoie le dossier après son TTL.
+  const remaining = fs.readdirSync(sessionDir);
+  assert.ok(remaining.includes('meta.json'));
+  assert.ok(remaining.includes('concat.tmp'), 'le manifeste concat.tmp doit rester');
+  storedChunks.rows.forEach((chunk) => assert.ok(fs.existsSync(path.join(sessionDir, chunk.part_name)), `${chunk.part_name} doit rester après l'assemblage`));
+  assert.equal(remaining.some((name) => name.endsWith('.incoming.tmp') || name === 'combined.tmp'), false);
+  assert.equal(remaining.some((name) => name.endsWith('.log')), false);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [uploadId])).rows[0].n, 0);
 
   // 5. Le transcodage publie 240p+480p, puis ajoute 720p+1080p.
@@ -172,6 +200,7 @@ test('upload reprenable + HLS multi-résolution + GC', { skip, timeout: 240000 }
   assert.equal(left.rows[0].n, 0);
   const staleChunks = await pool.query('SELECT count(*)::int AS n FROM upload_chunks WHERE upload_id = $1', [stale.data.uploadId]);
   assert.equal(staleChunks.rows[0].n, 0);
+  assert.equal(fs.existsSync(path.join(process.env.UPLOAD_DIR, 'sessions', String(stale.data.uploadId))), false);
 });
 
 test('l’échelle de qualités ne dépasse jamais la source', () => {

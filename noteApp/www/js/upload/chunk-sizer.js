@@ -1,15 +1,19 @@
+// Le premier morceau vaut 512 Kio; après chaque réponse, la taille suit le débit observé.
+// Le serveur accepte jusqu'à 4 Mio par PATCH, aussi bien pour le navigateur que pour Android.
 export const MIN_CHUNK = 512 * 1024;
-export const MAX_CHUNK = 2 * 1024 * 1024;
-export const ANDROID_MAX_CHUNK = 1024 * 1024;
-const STEP = 256 * 1024;
-const TARGET_SECONDS = 4; // un morceau devrait durer ~4 s : assez court pour perdre peu en cas de coupure
+export const MAX_CHUNK = 4 * 1024 * 1024;
+export const ANDROID_MAX_CHUNK = MAX_CHUNK;
+const STEP = 512 * 1024;
+const TARGET_SECONDS = 2; // vise une réponse environ toutes les deux secondes
+const LOW_SPEED_BYTES_PER_SECOND = 512 * 1024;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const roundTo = (value, unit) => Math.round(value / unit) * unit;
 
-// Taille de morceau adaptative (principe de TCP) :
-//  - réseau stable : on monte doucement, d'un pas à la fois, vers ce que le débit permet ;
-//  - échec ou réseau qui s'effondre : retour immédiat à la taille minimale.
+// Taille de morceau adaptative :
+//  - débit faible (jusqu'à 512 Kio/s) : on garde des morceaux de 512 Kio ;
+//  - débit plus élevé : on vise deux secondes de transfert et on monte par pas de 512 Kio ;
+//  - échec réseau : retour immédiat à 512 Kio pour limiter le coût d'une nouvelle tentative.
 export class ChunkSizer {
   constructor({ min = MIN_CHUNK, max = MAX_CHUNK } = {}) {
     this.min = min;
@@ -32,11 +36,28 @@ export class ChunkSizer {
   }
 
   onSuccess(bytes, milliseconds) {
-    // Mesure le débit puis le lisse pour éviter de réagir exagérément à un seul ralentissement.
+    // Mesure le débit courant et le lisse pour éviter de monter sur un succès atypique.
     const instant = bytes / Math.max(milliseconds, 1) * 1000;
     this.speed = this.speed ? this.speed * 0.6 + instant * 0.4 : instant;
     this.streak += 1;
-    // Vise un morceau d'environ quatre secondes, arrondi par pas de 64 Kio.
+    // Réagit immédiatement à une vraie baisse : ne pas continuer à envoyer 4 Mio
+    // si le dernier morceau révèle maintenant un débit faible.
+    if (instant <= LOW_SPEED_BYTES_PER_SECOND) {
+      this.speed = instant;
+      this.streak = 0;
+      this.size = this.min;
+      return this.size;
+    }
+
+    // Si le débit baisse sans passer sous le seuil faible, réduire dès le prochain morceau.
+    const measuredIdeal = clamp(roundTo(instant * TARGET_SECONDS, 64 * 1024), this.min, this.max);
+    if (measuredIdeal < this.size) {
+      this.size = measuredIdeal;
+      return this.size;
+    }
+
+    // À faible débit, garder 512 Kio évite qu'une seule requête reste longtemps en attente.
+    // Au-dessus de ce seuil, viser deux secondes de données et arrondir par pas de 64 Kio.
     const ideal = clamp(roundTo(this.speed * TARGET_SECONDS, 64 * 1024), this.min, this.max);
     // Deux succès consécutifs sont requis avant d'augmenter progressivement la taille.
     if (ideal > this.size && this.streak >= 2) this.size = Math.min(ideal, this.size + STEP);

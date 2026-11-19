@@ -4,7 +4,7 @@ import { pickAndroidVideos, isNativeAndroid, releaseAndroidUri } from '../upload
 import { h, formatBytes, toast } from './dom.js';
 
 const labels = {
-  queued: 'En attente', hashing: 'Vérification', uploading: 'Envoi', 'waiting-network': 'Attente réseau',
+  queued: 'En attente', hashing: 'Vérification', 'checking-source': 'Vérification', 'reading-chunk': 'Lecture du morceau', uploading: 'Envoi', 'waiting-network': 'Attente réseau',
   paused: 'En pause', processing: 'Traitement', missing_file: 'Fichier absent', inaccessible_file: 'Accès perdu',
   mismatch: 'Fichier différent', moved_file: 'Fichier déplacé', error: 'Erreur', needs_selection: 'À resélectionner',
 };

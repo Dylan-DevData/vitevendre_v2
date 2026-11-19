@@ -21,7 +21,7 @@ IndexedDB ne stocke jamais les octets de la vidéo, un Blob ou l’objet File. L
 | [`noteApp/www/js/main.js`](noteApp/www/js/main.js) | Crée l’interface principale et connecte les événements vidéo au gestionnaire d’upload. |
 | [`noteApp/www/js/ui/queued-upload-ui.js`](noteApp/www/js/ui/queued-upload-ui.js) | Gère le bouton de sélection multiple, les commandes et l’affichage de chaque tâche. |
 | [`noteApp/www/js/upload/native-video-source.js`](noteApp/www/js/upload/native-video-source.js) | Présente l’URI Android comme source lisible et appelle le pont Cordova. |
-| [`noteApp/www/js/upload/source.js`](noteApp/www/js/upload/source.js) | Ouvre la source et calcule l’empreinte par blocs. |
+| [`noteApp/www/js/upload/source.js`](noteApp/www/js/upload/source.js) | Ouvre la source et crée la clé rapide de session; garde aussi le calcul de contenu pour les anciennes tâches. |
 | [`noteApp/www/js/upload/file-verification.js`](noteApp/www/js/upload/file-verification.js) | Regroupe les vérifications d’accès, d’existence, de lecture et d’identité. |
 | [`noteApp/www/js/upload/upload-queue.js`](noteApp/www/js/upload/upload-queue.js) | Maintient les tâches, la limite de concurrence, la restauration et les états définitifs. |
 | [`noteApp/www/js/upload/storage.js`](noteApp/www/js/upload/storage.js) | Persiste uniquement les champs de métadonnées autorisés dans IndexedDB. |
@@ -36,16 +36,16 @@ IndexedDB ne stocke jamais les octets de la vidéo, un Blob ou l’objet File. L
 |---|---|
 | [`noteApp/cordova-plugins/vitevendre-persistent-video/plugin.xml`](noteApp/cordova-plugins/vitevendre-persistent-video/plugin.xml) | Déclare le plugin Cordova et associe son interface JavaScript à sa classe Android. |
 | [`noteApp/cordova-plugins/vitevendre-persistent-video/www/vv-video-source.js`](noteApp/cordova-plugins/vitevendre-persistent-video/www/vv-video-source.js) | Transmet les actions JavaScript au service natif Cordova `VvVideoSource`. |
-| [`noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java`](noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java) | Sélectionne les URI, vérifie les permissions, calcule l’empreinte native et lit les plages via `ContentResolver`. |
+| [`noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java`](noteApp/cordova-plugins/vitevendre-persistent-video/src/android/VvVideoSource.java) | Sélectionne les URI, vérifie les permissions, lit les plages via `ContentResolver` et garde le hachage natif pour les anciennes tâches. |
 
 ### Backend Node.js
 
 | Fichier | Responsabilité |
 |---|---|
 | [`backend/src/routes/upload.routes.js`](backend/src/routes/upload.routes.js) | Déclare les cinq opérations HTTP et applique l’authentification. |
-| [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) | Reçoit les demandes, stocke les morceaux, vérifie l’offset et les assemble à la finalisation. |
-| [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) | Enregistre les sessions, les lignes `upload_chunks` et le nombre d’octets confirmés dans PostgreSQL. |
-| [`backend/src/services/gc.service.js`](backend/src/services/gc.service.js) | Nettoie les sessions abandonnées; PostgreSQL supprime leurs morceaux par cascade après le TTL. |
+| [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) | Reçoit les demandes, stocke les morceaux `.part`, vérifie l’offset et les prépare pour FFmpeg à la finalisation. |
+| [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) | Enregistre les références `upload_chunks`; calcule la progression depuis les `.part` sur disque sans stocker leurs tailles dans PostgreSQL. |
+| [`backend/src/services/gc.service.js`](backend/src/services/gc.service.js) | Nettoie les sessions abandonnées et leurs fichiers `.part`. |
 | [`backend/src/services/transcode-queue.service.js`](backend/src/services/transcode-queue.service.js) | Place les vidéos finalisées dans la file de traitement et récupère les traitements après redémarrage. |
 | [`backend/src/services/ffmpeg.service.js`](backend/src/services/ffmpeg.service.js) | Transcode la source en qualités vidéo et prépare les playlists HLS. |
 | [`backend/src/services/events.service.js`](backend/src/services/events.service.js) | Diffuse les événements de publication au client. |
@@ -76,9 +76,9 @@ Une fiche comprend notamment `id`, `uri`, `name`, `mimeType`, `size`, `lastModif
 
 ### 4. Le client vérifie la source et prépare la session
 
-- [`noteApp/www/js/upload/source.js`](noteApp/www/js/upload/source.js) choisit comment lire une source et calcule son empreinte.
+- [`noteApp/www/js/upload/source.js`](noteApp/www/js/upload/source.js) choisit comment lire une source et crée une clé de tâche sans parcourir le contenu.
 - [`noteApp/www/js/upload/file-verification.js`](noteApp/www/js/upload/file-verification.js) regroupe les contrôles d’accès, de lecture et d’identité.
-- Pour Android, le calcul de l’empreinte complète est effectué dans le code natif par blocs de 512 Kio, avec un tampon borné. Le fichier complet n’est pas chargé en mémoire.
+- Les nouvelles tâches ne hachent pas tout le fichier avant l'upload. Les anciennes tâches qui ont déjà un `uploadId` migrent vers leur clé rapide à la restauration; les anciennes tâches sans session gardent leur empreinte complète pour retrouver un éventuel `POST` déjà créé.
 - [`noteApp/www/js/upload/upload-task.js`](noteApp/www/js/upload/upload-task.js) appelle ensuite `POST /api/uploads` via [`noteApp/www/js/api-core.js`](noteApp/www/js/api-core.js). Cette requête envoie les métadonnées nécessaires, pas la vidéo.
 - Le backend renvoie un `uploadId` propre à la tâche. `upload-queue.js` le sauvegarde dans la fiche IndexedDB.
 
@@ -88,16 +88,16 @@ Une fiche comprend notamment `id`, `uri`, `name`, `mimeType`, `size`, `lastModif
 - `AndroidContentFile.read()` dans `native-video-source.js` appelle `readRange`.
 - `VvVideoSource.java` vérifie l’accès et les métadonnées, puis utilise `ContentResolver`, `ParcelFileDescriptor` et `FileChannel` pour lire uniquement la plage demandée.
 - Le morceau passe temporairement par JavaScript pour être envoyé. La vidéo entière n’est pas conservée en mémoire.
-- [`noteApp/www/js/upload/chunk-sizer.js`](noteApp/www/js/upload/chunk-sizer.js) adapte la taille aux transferts observés. Android est plafonné à 1 Mio et le client respecte aussi la limite renvoyée par le serveur.
+- [`noteApp/www/js/upload/chunk-sizer.js`](noteApp/www/js/upload/chunk-sizer.js) adapte la taille aux transferts observés de 512 Kio à 4 Mio. Android et le navigateur respectent la limite renvoyée par le serveur.
 
 ### 6. Le serveur enregistre chaque morceau et confirme sa position
 
 - [`backend/src/routes/upload.routes.js`](backend/src/routes/upload.routes.js) déclare les routes de création, état, morceaux, finalisation et annulation.
-- [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) traite les requêtes, écrit chaque morceau dans PostgreSQL et assemble les morceaux à la finalisation.
-- [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) enregistre les lignes `upload_chunks`, l’état de la session et `received_bytes` dans PostgreSQL.
+- [`backend/src/controllers/upload.controller.js`](backend/src/controllers/upload.controller.js) traite les requêtes, écrit chaque morceau sous `uploads/sessions/<uploadId>.<chunkNumber>.part`, puis prépare le flux source à la finalisation.
+- [`backend/src/models/upload.model.js`](backend/src/models/upload.model.js) enregistre les références `upload_chunks` et l’état de la session; la progression vient des tailles `.part` sur disque.
 - Le client met à jour la progression individuelle après la confirmation du serveur.
 
-Les morceaux sont transmis dans l’ordre. PostgreSQL conserve `chunk_number` et `byte_offset` pour chaque ligne; `receivedBytes` reste la position confirmée utilisée pour la reprise.
+Les morceaux sont transmis dans l’ordre. PostgreSQL conserve leur numéro et leur nom de fichier; `receivedBytes` est calculé depuis les tailles des `.part` référencés.
 
 ### 7. Une coupure déclenche une reprise depuis la source de vérité serveur
 
@@ -111,9 +111,10 @@ Le service [`noteApp/www/js/services/network.js`](noteApp/www/js/services/networ
 ### 8. Le backend finalise, puis traite la vidéo
 
 - `upload-task.js` envoie `POST /api/uploads/:id/complete` quand tous les octets sont confirmés et que la vérification finale de la source réussit.
-- `upload.controller.js` relit les morceaux PostgreSQL dans l’ordre, vérifie les offsets et la taille, écrit le fichier source, puis supprime les morceaux après finalisation.
+- `upload.controller.js` vérifie les `.part` dans l’ordre et prépare un manifeste pour FFmpeg.
+- `ffmpeg.service.js` demande à FFmpeg de lire les `.part` comme un seul flux et d’écrire `uploads/sources/<videoId>.mp4`; après validation, la base garde la vidéo et sa référence `source_name`, et les `.part` sont supprimés.
 - [`backend/src/services/transcode-queue.service.js`](backend/src/services/transcode-queue.service.js) lance le traitement asynchrone.
-- [`backend/src/services/ffmpeg.service.js`](backend/src/services/ffmpeg.service.js) produit les qualités et playlists HLS.
+- [`backend/src/services/ffmpeg.service.js`](backend/src/services/ffmpeg.service.js) lit le MP4 final et produit les qualités et playlists HLS.
 - [`backend/src/services/events.service.js`](backend/src/services/events.service.js) notifie le client quand la vidéo est prête.
 - `queued-upload-ui.js` reçoit l’événement et demande à `upload-queue.js` de retirer la tâche d’IndexedDB et de libérer l’autorisation Android devenue inutile.
 

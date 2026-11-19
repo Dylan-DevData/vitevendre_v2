@@ -9,10 +9,11 @@ const router = express.Router();
 // Protocole de reprise par offset (inspiré de tus.io) :
 //   POST   /            ouvre (ou reprend) une session
 //   GET    /:id         receivedBytes = offset où reprendre
-//   PATCH  /:id         ajoute un morceau (en-tête Upload-Offset, corps = octets bruts, en flux)
-//   POST   /:id/complete  vérifie puis lance le transcodage
+//   PATCH  /:id         ajoute une plage brute qui sera stockée en fichier .part
+//   POST   /:id/complete  FFmpeg lit les .part dans l'ordre, crée le MP4 puis lance le HLS
 //   DELETE /:id         annule
-// Aucun parseur sur PATCH : le contrôleur lit un morceau borné puis l'insère en base.
+// Aucun parseur sur PATCH : le contrôleur reçoit un morceau borné, le met sur disque
+// et conserve seulement sa référence dans PostgreSQL; tailles et offsets sont calculés sur disque.
 router.post('/', authenticate, controller.createUpload);
 router.get('/:id', authenticate, controller.getUpload);
 router.patch('/:id', authenticate, controller.appendChunk);

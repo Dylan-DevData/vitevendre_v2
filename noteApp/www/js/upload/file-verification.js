@@ -34,6 +34,8 @@ export async function reopenFile(metadata) {
   throw new SourceGoneError('Sélectionne à nouveau ce fichier pour reprendre l’envoi.');
 }
 
+// Donne au UploadTask une seule plage non modifiée. Le client ne crée pas les fichiers
+// .part : il envoie cette plage, et le backend la stocke/référence pour FFmpeg.
 export function readFileChunk(source, start, end) { return source.read(start, end); }
 
 // Android ouvre puis ferme le ParcelFileDescriptor dans chaque appel readRange. Aucun descripteur

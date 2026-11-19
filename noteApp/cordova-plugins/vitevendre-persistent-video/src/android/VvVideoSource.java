@@ -27,7 +27,8 @@ import java.util.List;
 /** Pont Android SAF : conserve l'accès URI accordé et lit uniquement les plages demandées. */
 public final class VvVideoSource extends CordovaPlugin {
     private static final int PICK_REQUEST = 7314;
-    private static final int MAX_RANGE_BYTES = 1024 * 1024;
+    // Doit rester aligné sur ANDROID_MAX_CHUNK côté JavaScript et UPLOAD_CHUNK_MAX_BYTES côté serveur.
+    private static final int MAX_RANGE_BYTES = 4 * 1024 * 1024;
     private CallbackContext pickerCallback;
 
     @Override

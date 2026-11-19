@@ -79,16 +79,20 @@ export function createApi({ base, getToken = () => null, onUnauthorized = () => 
     unfollow: (id) => json('DELETE', `/api/users/${id}/follow`),
 
     // --- Upload reprenable par offset ---
-    // Seul patchChunk transporte des octets vidéo ; les autres opérations échangent du JSON.
+    // Le client envoie des plages brutes; elles deviennent des .part sur le serveur.
+    // Seul patchChunk transporte des octets vidéo; les autres opérations échangent du JSON.
     createUpload: (body, signal) => json('POST', '/api/uploads', body, { signal }),
     getUpload: (id, signal) => json('GET', `/api/uploads/${id}`, undefined, { signal }),
     // Ne lève pas pour 409 : le serveur y renvoie l'offset réel à reprendre.
     patchChunk: (id, offset, bytes, signal) => raw('PATCH', `/api/uploads/${id}`, {
       body: bytes,
       signal,
-      // L'offset permet au backend de détecter un morceau répété ou manquant.
+      // L'offset permet au backend de détecter un morceau répété ou manquant avant
+      // d'écrire un .part et d'enregistrer sa référence.
       headers: { 'Upload-Offset': String(offset), 'Content-Type': 'application/octet-stream' },
     }),
+    // Cette demande part uniquement après le dernier PATCH confirmé; le backend
+    // appelle FFmpeg pour assembler le MP4 puis lance le traitement HLS.
     completeUpload: (id) => json('POST', `/api/uploads/${id}/complete`),
     abortUpload: (id) => json('DELETE', `/api/uploads/${id}`),
 
